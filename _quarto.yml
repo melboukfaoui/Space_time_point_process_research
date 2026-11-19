@@ -1,0 +1,13 @@
+project:
+  type: default
+  output-dir: _output
+
+execute:
+  # Re-run a notebook only when its source changes; results are cached in _freeze/
+  freeze: auto
+
+format:
+  html:
+    toc: true
+    code-fold: false
+    embed-resources: true

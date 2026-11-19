@@ -1,0 +1,40 @@
+# OS / editors
+.DS_Store
+.vscode/
+.idea/
+
+# Python / uv
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# R / renv (renv.lock and renv/activate.R ARE committed)
+.Rhistory
+.RData
+.Rproj.user/
+renv/library/
+renv/local/
+renv/staging/
+renv/cellar/
+renv/lock/
+renv/python/
+renv/sandbox/
+
+# Quarto (commit _freeze/ so others don't have to re-run everything)
+.quarto/
+_output/
+*_files/
+notebooks/*.html
+
+# Data: keep folders, not contents
+data/raw/*
+data/processed/*
+!data/**/.gitkeep
+
+# Models / large outputs
+*.pt
+*.ckpt
+*.parquet

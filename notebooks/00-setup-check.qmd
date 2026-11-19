@@ -1,0 +1,43 @@
+---
+title: "Setup check: Python and R in one notebook"
+format: html
+---
+
+This notebook checks that Python (uv) and R (renv) both work. Because it has an
+R chunk, Quarto renders it with **knitr**, and the Python chunks run through
+**reticulate** using the project's `.venv`. Objects pass between languages:
+`py$name` in R, `r.name` in Python.
+
+## Simulate in Python
+
+```{python}
+from stpp import simulate_poisson
+
+events = simulate_poisson(rate=200, T=1.0, seed=42)
+print(f"{len(events)} events")
+```
+
+## Analyse in R
+
+```{r}
+ev <- as.data.frame(py$events)
+names(ev) <- c("t", "x", "y")
+summary(ev)
+```
+
+```{r}
+#| fig-cap: "Simulated homogeneous Poisson events, coloured by time"
+library(ggplot2)
+ggplot(ev, aes(x, y, colour = t)) +
+  geom_point(size = 1) +
+  coord_equal() +
+  theme_minimal()
+```
+
+## Back to Python
+
+```{python}
+n_r = r.ev.shape[0]
+assert n_r == len(events)
+print("Round trip OK")
+```
