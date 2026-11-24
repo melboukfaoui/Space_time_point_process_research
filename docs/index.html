@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Space-Time Point Process Research</title>
+<style>
+  :root { --bg: #f7f8f9; --fg: #16202a; --muted: #566372; --rule: #dde2e8; --accent: #1f5f8b; --card: #ffffff; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #0f151b; --fg: #e3e9ef; --muted: #98a6b4; --rule: #2a3540; --accent: #7fb6dd; --card: #161e26; color-scheme: dark; }
+  }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.6 system-ui, -apple-system, "Segoe UI", sans-serif; padding: 48px max(16px, env(safe-area-inset-left)); }
+  main { max-width: 760px; margin: 0 auto; display: grid; gap: 28px; }
+  h1 { margin: 0; font-size: clamp(26px, 5vw, 34px); line-height: 1.2; }
+  p { margin: 0; color: var(--muted); }
+  ul { list-style: none; margin: 0; padding: 0; display: grid; gap: 12px; }
+  li a { display: block; background: var(--card); border: 1px solid var(--rule); border-radius: 8px; padding: 14px 16px; color: var(--fg); text-decoration: none; }
+  li a:hover, li a:focus-visible { border-color: var(--accent); outline: none; }
+  li b { color: var(--accent); }
+  li span { display: block; font-size: 14px; color: var(--muted); }
+  h2 { margin: 0; font-size: 15px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Space-time point process research</h1>
+    <p>Neural detection of localized regime shifts in self-exciting space-time point processes. Mamoune El Boukfaoui, supervised by Robert Clements (USF Data Institute).</p>
+  </header>
+
+  <section>
+    <h2>Proposal</h2>
+    <ul>
+      <li><a href="project-report.pdf"><b>Project report (PDF)</b><span>Data sources, method, current status, plan and open questions</span></a></li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>Notebooks</h2>
+    <ul>
+      <li><a href="04-hawkes-spacetime-explained.html"><b>04 · Space-time Hawkes, explained</b><span>Simulation by thinning, maximum-likelihood fit, checks, with the maths and every line of code explained</span></a></li>
+      <li><a href="03-hawkes-explained.html"><b>03 · Temporal Hawkes, explained</b><span>The same steps for a time-only Hawkes process</span></a></li>
+      <li><a href="02-hawkes-thinning-and-fit.html"><b>02 · Temporal Hawkes, fast fitting</b><span>O(n) likelihood with an exact gradient, residual checks, 100 repeated simulations</span></a></li>
+      <li><a href="01-hawkes-simulate-and-fit.html"><b>01 · Space-time Hawkes, branching simulator</b><span>Branching simulation and maximum-likelihood fit, with a 30-run recovery check</span></a></li>
+    </ul>
+  </section>
+</main>
+</body>
+</html>

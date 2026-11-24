@@ -8,6 +8,8 @@ Mamoune El Boukfaoui · Supervisor: Robert Clements (USF Data Institute)
 
 Research brief (data sources, method, status, plan): [`reports/project-report.pdf`](reports/project-report.pdf).
 
+Rendered notebooks (HTML) are in [`docs/`](docs/), starting from [`docs/index.html`](docs/index.html). To view them as web pages, turn on GitHub Pages for the `main` branch, `/docs` folder.
+
 ## Overview
 
 Events such as earthquakes and limit-order-book orders arrive in clustered, self-exciting
