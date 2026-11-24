@@ -4,6 +4,10 @@
 
 Mamoune El Boukfaoui · Supervisor: Robert Clements (USF Data Institute)
 
+## Project proposal
+
+Research brief (data sources, method, status, plan): [`reports/project-report.pdf`](reports/project-report.pdf).
+
 ## Overview
 
 Events such as earthquakes and limit-order-book orders arrive in clustered, self-exciting
