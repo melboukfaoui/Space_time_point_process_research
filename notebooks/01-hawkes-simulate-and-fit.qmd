@@ -1,0 +1,444 @@
+---
+title: "Space-time Hawkes process: simulation and maximum-likelihood fitting"
+format:
+  html:
+    code-annotations: below
+    toc: true
+    html-math-method: katex
+jupyter: python3
+---
+
+This notebook explains, line by line, the Python code in
+[`src/stpp/hawkes.py`](../src/stpp/hawkes.py):
+
+1. the **model**,
+2. the **simulator** (a Python port of Robert's `R/simulate_hawkes_clustering.R`),
+3. the **mathematics of fitting** by maximum likelihood,
+4. the **fitting code**, and
+5. a check that the fit recovers the true parameters.
+
+# 1. The model
+
+We observe events $(t_i, x_i, y_i)$, $i = 1, \dots, n$, in a time window $[0, T]$ and a
+rectangle $W = [x_{\min}, x_{\max}] \times [y_{\min}, y_{\max}]$. A point process is described
+by its **conditional intensity**: the instantaneous rate of events at $(t, x, y)$, given
+everything that happened before $t$ (the history $\mathcal H_t$):
+
+$$
+\lambda(t, x, y \mid \mathcal H_t) \;\approx\;
+\frac{P(\text{an event in } [t, t+dt] \times [x, x+dx] \times [y, y+dy] \mid \mathcal H_t)}{dt\,dx\,dy}.
+$$
+
+Our space-time Hawkes model is
+
+$$
+\lambda(t, x, y) \;=\; \mu \;+\; \sum_{j:\, t_j < t}
+\underbrace{K}_{\text{how many}}\;
+\underbrace{\beta e^{-\beta (t - t_j)}}_{\text{when}}\;
+\underbrace{\frac{1}{2\pi\sigma^2}\exp\!\Big(-\frac{(x-x_j)^2 + (y-y_j)^2}{2\sigma^2}\Big)}_{\text{where}}.
+$$
+
+| Parameter | Meaning |
+|---|---|
+| $\mu$ | background rate: events per unit time per unit area that arrive "out of nowhere" |
+| $K$ | branching ratio: expected number of direct children of each event |
+| $\beta$ | temporal decay: a child arrives on average $1/\beta$ time units after its parent |
+| $\sigma$ | spatial spread: children land a Gaussian distance $\sigma$ (per coordinate) from the parent |
+
+The "when" factor integrates to 1 over $(0, \infty)$ and the "where" factor integrates to 1 over
+the plane. So each past event adds a bump of total mass exactly $K$: on average it triggers $K$
+children. That is why $K$ is the branching ratio.
+
+**Branching (cluster) view.** The same model can be generated in two steps:
+
+- *Immigrants*: a homogeneous Poisson process with rate $\mu$ on $[0, T] \times W$.
+- *Offspring*: each event, immigrant or child, independently has $\text{Poisson}(K)$ children.
+  Each child's delay is $\text{Exp}(\beta)$ and its displacement is $N(0, \sigma^2)$ in each of
+  $x$ and $y$.
+
+Each immigrant starts a family tree. The expected tree size is
+$1 + K + K^2 + \dots = 1/(1-K)$, which is finite only when $K < 1$ (a *subcritical* process).
+With $K \ge 1$ the cascades never die out. So the expected number of events is about
+
+$$
+E[N] \approx \frac{\mu\,|W|\,T}{1 - K}.
+$$
+
+# 2. The simulator, line by line
+
+The simulator uses the branching view directly: generate immigrants, then generation after
+generation of children, until a generation has no children.
+
+```{.python}
+def simulate_hawkes(tmax, W, mu, K, beta, sigma, seed=None, clip=True):
+    if not 0 <= K < 1:                                              # <1>
+        raise ValueError("K must be in [0, 1); ...")
+    rng = np.random.default_rng(seed)                               # <2>
+    xmin, xmax, ymin, ymax = W                                      # <3>
+    area = (xmax - xmin) * (ymax - ymin)                            # <4>
+
+    n_bg = rng.poisson(mu * area * tmax)                            # <5>
+    gen_t = rng.uniform(0, tmax, n_bg)                              # <6>
+    gen_x = rng.uniform(xmin, xmax, n_bg)                           # <6>
+    gen_y = rng.uniform(ymin, ymax, n_bg)                           # <6>
+    all_t, all_x, all_y = [gen_t], [gen_x], [gen_y]                 # <7>
+
+    while gen_t.size > 0:                                           # <8>
+        n_children = rng.poisson(K, gen_t.size)                     # <9>
+        par_t = np.repeat(gen_t, n_children)                        # <10>
+        par_x = np.repeat(gen_x, n_children)                        # <10>
+        par_y = np.repeat(gen_y, n_children)                        # <10>
+        m = par_t.size                                              # <11>
+        gen_t = par_t + rng.exponential(1 / beta, m)                # <12>
+        gen_x = par_x + rng.normal(0, sigma, m)                     # <13>
+        gen_y = par_y + rng.normal(0, sigma, m)                     # <13>
+        all_t.append(gen_t)                                         # <14>
+        all_x.append(gen_x)                                         # <14>
+        all_y.append(gen_y)                                         # <14>
+
+    events = np.column_stack([np.concatenate(all_t),                # <15>
+                              np.concatenate(all_x),
+                              np.concatenate(all_y)])
+    if clip:                                                        # <16>
+        t, x, y = events.T
+        inside = (t <= tmax) & (x >= xmin) & (x <= xmax) & (y >= ymin) & (y <= ymax)
+        events = events[inside]
+    return events[np.argsort(events[:, 0])]                         # <17>
+```
+1. Refuse $K \ge 1$. A supercritical process explodes and the `while` loop would never end.
+   (The R version has no such check.)
+2. A random-number generator. Passing `seed` makes a simulation reproducible.
+3. Unpack the window $W = (x_{\min}, x_{\max}, y_{\min}, y_{\max})$, as in the R code.
+4. $|W|$, the area of the rectangle.
+5. **Number of immigrants.** For a Poisson process with rate $\mu$ on a region of volume
+   $|W|\,T$, the count is $\text{Poisson}(\mu |W| T)$. This is R's
+   `rpois(1, lambda = total_n)`.
+6. **Where and when the immigrants are.** Given the count, a homogeneous Poisson process puts
+   its points independently and uniformly over the region. Same as R's three `runif` calls.
+7. Lists that collect every generation. The current generation is held in `gen_*`.
+8. Keep going while the current generation has at least one event. A generation's size is on
+   average $K$ times the previous one's, so with $K < 1$ the loop ends quickly.
+9. **How many children** each event in the current generation has: one independent
+   $\text{Poisson}(K)$ draw per event. Same as R's `rpois(homog_p, K)`.
+10. `np.repeat` copies each parent's time and location once per child. A parent with 3 children
+    appears 3 times and a parent with 0 children disappears. This replaces R's
+    `[off_n > 0]` filter and its `for (i in ...)` loop over parents with one vectorised step.
+11. `m` is the total number of children in the new generation.
+12. **Child time = parent time + Exp($\beta$) delay.** NumPy's `exponential` takes the *mean*
+    $1/\beta$, while R's `rexp(..., rate = beta)` takes the rate. They give the same
+    distribution. The exponential density $\beta e^{-\beta u}$ is exactly the "when" factor in
+    $\lambda$.
+13. **Child location = parent location + $N(0, \sigma^2)$** in each coordinate, independently.
+    The resulting 2-D density is the "where" factor in $\lambda$. Same as R's `rnorm`.
+14. Save the new generation. On the next pass of the loop the children become the parents.
+15. Stack all generations into an $n \times 3$ array with columns $(t, x, y)$.
+16. **Clipping.** Children can land after $T$ or outside $W$. In real data we would never see
+    them, so by default we drop them. The R version keeps them, which is equivalent to
+    `clip=False` here. The likelihood below assumes we only see events inside the window.
+17. Sort by time. The likelihood needs to know which events came before which.
+
+Robert's file currently has four functions (`_temporal`, `_spatial`, `_bg` and the base one).
+Their bodies are identical for now. They look like placeholders for variants with a different
+temporal kernel (`_temporal` loads `poweRlaw`, so probably a power-law delay instead of an
+exponential one), a different spatial kernel, and a non-constant background. This notebook
+covers the base model.
+
+## Running it
+
+```{python}
+import numpy as np
+import matplotlib.pyplot as plt
+from stpp.hawkes import simulate_hawkes, fit_hawkes
+
+truth = {"mu": 0.05, "K": 0.5, "beta": 1.0, "sigma": 0.3}
+T, W = 100.0, (0.0, 10.0, 0.0, 10.0)
+
+events = simulate_hawkes(T, W, **truth, seed=0)
+t, x, y = events.T
+print(f"{len(events)} events; rough expectation mu*|W|*T/(1-K) = "
+      f"{truth['mu'] * 100 * T / (1 - truth['K']):.0f} (minus edge losses)")
+```
+
+```{python}
+#| fig-cap: "Left: event locations, coloured by time. Clusters are families of triggered events. Right: cumulative count over time. The jumps are cascades, and a Poisson process would give a straight line."
+fig, axes = plt.subplots(1, 2, figsize=(10, 4.2))
+sc = axes[0].scatter(x, y, c=t, s=6, cmap="viridis")
+axes[0].set(xlabel="x", ylabel="y", aspect="equal", title="Space")
+fig.colorbar(sc, ax=axes[0], label="time")
+axes[1].step(t, np.arange(1, len(t) + 1), where="post")
+axes[1].plot([0, T], [0, len(t)], ls="--", c="grey", lw=1)
+axes[1].set(xlabel="time", ylabel="cumulative events", title="Time")
+plt.tight_layout()
+```
+
+# 3. The mathematics of fitting
+
+We want the parameters $\theta = (\mu, K, \beta, \sigma)$ that make the observed events most
+probable: the **maximum-likelihood estimate** (MLE).
+
+## 3.1 The point-process likelihood
+
+Cut $[0, T] \times W$ into tiny cells of volume $\Delta = dt\,dx\,dy$. Given the past, each cell
+contains
+
+- one event with probability $\approx \lambda(t, x, y)\,\Delta$, or
+- no event with probability $\approx 1 - \lambda\Delta \approx e^{-\lambda \Delta}$.
+
+The probability of the whole observed pattern is the product over cells: a factor
+$\lambda(t_i, x_i, y_i)\,\Delta$ for each of the $n$ cells that hold an event, and
+$e^{-\lambda \Delta}$ for every empty cell. As the cells shrink, the product of the empty-cell
+factors becomes $\exp\!\big(-\int\!\!\int\!\!\int \lambda\big)$. Dropping the constant
+$\Delta^n$ and taking logs gives the standard point-process log-likelihood:
+
+$$
+\boxed{\;\ell(\theta) \;=\; \sum_{i=1}^{n} \log \lambda(t_i, x_i, y_i)
+\;-\; \underbrace{\int_0^T\!\!\int_W \lambda(t, x, y)\,dx\,dy\,dt}_{\Lambda(\theta),\ \text{the compensator}}\;}
+$$
+
+The two terms pull in opposite directions:
+
+- The **first term** rewards a high intensity *where events actually happened*.
+- The **compensator** $\Lambda$ is the expected number of events the model predicts in the
+  window. It penalises a high intensity *everywhere*.
+
+Without the penalty, the fit would simply make $\lambda$ huge. The MLE balances the two. In
+fact, at the optimum the expected count equals the observed count, $\Lambda(\hat\theta) = n$.
+
+## 3.2 The first term: $\log \lambda$ at each event
+
+Plug the model into $\lambda(t_i, x_i, y_i)$. Only events strictly earlier than $t_i$
+contribute:
+
+$$
+\lambda_i = \mu + \sum_{j:\, t_j < t_i} K \beta e^{-\beta \Delta t_{ij}}
+\frac{1}{2\pi\sigma^2} e^{-d_{ij}^2 / (2\sigma^2)},
+\qquad \Delta t_{ij} = t_i - t_j,\;\; d_{ij}^2 = (x_i - x_j)^2 + (y_i - y_j)^2.
+$$
+
+$\Delta t_{ij}$ and $d^2_{ij}$ do not depend on $\theta$, so we compute them **once** for every
+pair $j < i$ and reuse them on each likelihood evaluation.
+
+## 3.3 The compensator in closed form
+
+Integrate term by term. The background is a constant, so its integral is
+$\mu\,|W|\,T$. For the bump of each past event $j$, time and space factorise:
+
+**Time.** The bump starts at $t_j$ and is cut off at $T$:
+$$
+\int_{t_j}^{T} \beta e^{-\beta (t - t_j)}\,dt = 1 - e^{-\beta (T - t_j)}.
+$$
+An event near the end of the window has had little time to trigger children, so it gets less
+than its full mass.
+
+**Space.** A 2-D Gaussian with independent coordinates integrates over a rectangle as a product
+of two 1-D normal probabilities ($\Phi$ is the standard normal CDF):
+$$
+\int_W \frac{e^{-d^2/(2\sigma^2)}}{2\pi\sigma^2}\,dx\,dy =
+\Big[\Phi\big(\tfrac{x_{\max} - x_j}{\sigma}\big) - \Phi\big(\tfrac{x_{\min} - x_j}{\sigma}\big)\Big]
+\Big[\Phi\big(\tfrac{y_{\max} - y_j}{\sigma}\big) - \Phi\big(\tfrac{y_{\min} - y_j}{\sigma}\big)\Big].
+$$
+An event near the edge of $W$ sends some of its children outside, where we can't see them.
+
+So
+
+$$
+\Lambda(\theta) = \mu |W| T + K \sum_{j=1}^{n}
+\big(1 - e^{-\beta (T - t_j)}\big)\, P^x_j(\sigma)\, P^y_j(\sigma).
+$$
+
+These two edge corrections are what make the estimates unbiased even though we clipped the
+data in the simulator.
+
+## 3.4 Maximising
+
+There is no closed-form maximiser, so we maximise $\ell$ numerically.
+
+- **Reparametrise on the log scale.** All four parameters must be positive. We optimise over
+  $\phi = \log\theta$, which can be any real number, so the optimiser can't step into
+  impossible values such as $\sigma < 0$.
+- **Minimise $-\ell(\phi)$ with BFGS**, a quasi-Newton method. It builds up an approximation to
+  the curvature from successive gradients. SciPy computes the gradient by finite differences.
+- **Standard errors.** For large samples the MLE is approximately normal with covariance equal
+  to the inverse of the *observed Fisher information*. That is the Hessian (matrix of second
+  derivatives) of $-\ell$ at the optimum:
+  $$
+  \widehat{\text{Cov}}(\hat\phi) = \big[\nabla^2 (-\ell)(\hat\phi)\big]^{-1}.
+  $$
+  A sharply curved likelihood means a well-determined parameter and a small standard error.
+- **Delta method back to the original scale.** $\theta = e^\phi$ gives
+  $d\theta/d\phi = e^\phi = \theta$, so
+  $$
+  \text{SE}(\hat\theta) \approx \hat\theta \cdot \text{SE}(\hat\phi).
+  $$
+
+**Cost.** The pairwise sum is $O(n^2)$. That is fine for a few thousand events: the fit below
+takes under a second. For large catalogues or order books you would truncate pairs with
+large $\Delta t$ or $d$, where the kernel is negligible.
+
+# 4. The fitting code, line by line
+
+## Pairwise gaps
+
+```{.python}
+def _pairs(events):
+    t, x, y = events.T                                       # <1>
+    i, j = np.tril_indices(len(t), k=-1)                     # <2>
+    dt = t[i] - t[j]                                         # <3>
+    d2 = (x[i] - x[j]) ** 2 + (y[i] - y[j]) ** 2             # <4>
+    return i, dt, d2
+```
+1. Split the $n \times 3$ array into its three columns.
+2. Every index pair $(i, j)$ with $j < i$, i.e. the strict lower triangle of an $n \times n$
+   matrix. The events are sorted by time, so $j < i$ means "$j$ happened before $i$". This gives
+   $n(n-1)/2$ pairs.
+3. $\Delta t_{ij} = t_i - t_j > 0$.
+4. $d^2_{ij}$, the squared distance. These two vectors don't depend on $\theta$, so they're
+   computed once (§3.2).
+
+## Negative log-likelihood
+
+```{.python}
+def neg_log_likelihood(theta, events, tmax, W, pairs=None):
+    mu, K, beta, sigma = np.exp(theta)                                          # <1>
+    t, x, y = events.T
+    n = len(t)
+    xmin, xmax, ymin, ymax = W
+    i, dt, d2 = pairs if pairs is not None else _pairs(events)                  # <2>
+
+    g = K * beta * np.exp(-beta * dt) \
+        * np.exp(-d2 / (2 * sigma**2)) / (2 * np.pi * sigma**2)                 # <3>
+    lam = mu + np.bincount(i, weights=g, minlength=n)                           # <4>
+    log_lam_sum = np.sum(np.log(lam))                                           # <5>
+
+    time_mass = 1 - np.exp(-beta * (tmax - t))                                  # <6>
+    px = norm.cdf((xmax - x) / sigma) - norm.cdf((xmin - x) / sigma)            # <7>
+    py = norm.cdf((ymax - y) / sigma) - norm.cdf((ymin - y) / sigma)            # <7>
+    area = (xmax - xmin) * (ymax - ymin)
+    compensator = mu * area * tmax + K * np.sum(time_mass * px * py)            # <8>
+
+    return -(log_lam_sum - compensator)                                         # <9>
+```
+1. The optimiser works with $\phi = \log\theta$ (§3.4). Exponentiate to get the actual
+   parameters, which are always positive.
+2. Reuse the precomputed pair arrays if they were passed in. This saves an $O(n^2)$ step on
+   every call.
+3. The triggering contribution of event $j$ to event $i$, for every pair at once:
+   $K\beta e^{-\beta\Delta t_{ij}}\,\frac{1}{2\pi\sigma^2}e^{-d^2_{ij}/2\sigma^2}$.
+4. **$\lambda_i$.** `np.bincount(i, weights=g)` adds up `g` over all pairs that share the same
+   $i$, giving $\sum_{j<i}(\cdot)$ for each event. `minlength=n` makes sure event 0, which has
+   no earlier events, gets a 0. Then add the background $\mu$.
+5. First term of $\ell$: $\sum_i \log\lambda_i$.
+6. Time part of the compensator: $1 - e^{-\beta(T - t_j)}$ for each event (§3.3).
+7. Space part: the share of each event's Gaussian that lies inside $W$, as a product of
+   normal-CDF differences (§3.3).
+8. $\Lambda(\theta) = \mu|W|T + K\sum_j (\text{time share})(\text{space share})$.
+9. Return $-\ell$, because optimisers *minimise*.
+
+## Fitting and standard errors
+
+```{.python}
+def _numerical_hessian(f, theta, h=1e-4):
+    k = len(theta)
+    H = np.zeros((k, k))
+    for a in range(k):
+        for b in range(a, k):                                                   # <1>
+            ea, eb = np.eye(k)[a] * h, np.eye(k)[b] * h                         # <2>
+            H[a, b] = H[b, a] = (
+                f(theta + ea + eb) - f(theta + ea - eb)
+                - f(theta - ea + eb) + f(theta - ea - eb)
+            ) / (4 * h * h)                                                     # <3>
+    return H
+
+def fit_hawkes(events, tmax, W, start=(0.1, 0.5, 1.0, 1.0)):
+    pairs = _pairs(events)                                                      # <4>
+
+    def f(theta):
+        return neg_log_likelihood(theta, events, tmax, W, pairs)                # <5>
+
+    res = minimize(f, np.log(start), method="BFGS")                             # <6>
+    est = np.exp(res.x)                                                         # <7>
+    cov_log = np.linalg.inv(_numerical_hessian(f, res.x))                       # <8>
+    se = est * np.sqrt(np.diag(cov_log))                                        # <9>
+    return HawkesFit(estimate=dict(zip(PARAM_NAMES, est)),
+                     std_error=dict(zip(PARAM_NAMES, se)),
+                     log_likelihood=-res.fun,                                   # <10>
+                     converged=bool(res.success))
+```
+1. The Hessian is symmetric, so we only compute the upper triangle ($b \ge a$) and mirror it.
+2. Small steps of size $h$ along coordinate $a$ and coordinate $b$.
+3. Central finite-difference formula for a second derivative:
+   $\partial^2 f/\partial\phi_a\partial\phi_b \approx
+   [f(+,+) - f(+,-) - f(-,+) + f(-,-)]/(4h^2)$.
+4. Compute the pairwise gaps once, before optimising.
+5. A one-argument function of $\phi$ for the optimiser to minimise. It "closes over" the data.
+6. Start at a rough guess, on the log scale, and minimise $-\ell$ with BFGS. `res.x` is
+   $\hat\phi$.
+7. Back to the original scale: $\hat\theta = e^{\hat\phi}$.
+8. Invert the observed information (the Hessian of $-\ell$ at $\hat\phi$) to get the
+   covariance of $\hat\phi$.
+9. Delta method: $\text{SE}(\hat\theta) = \hat\theta \cdot \text{SE}(\hat\phi)$.
+10. `res.fun` is the minimised $-\ell$, so the log-likelihood is its negative.
+
+# 5. Does it work?
+
+## One fit
+
+```{python}
+fit = fit_hawkes(events, T, W)
+print(fit.summary(truth))
+```
+
+Every estimate is within about two standard errors of the true value.
+
+## Repeated simulations
+
+One fit could be lucky. Repeat simulate-then-fit 30 times and check three things:
+
+- Are the estimates centred on the truth (no bias)?
+- Do the reported standard errors match the actual spread of the estimates?
+- Do 95% confidence intervals, $\hat\theta \pm 1.96\,\text{SE}$, contain the truth about 95%
+  of the time?
+
+```{python}
+import pandas as pd
+
+rows = []
+for seed in range(1, 31):
+    ev = simulate_hawkes(T, W, **truth, seed=seed)
+    f = fit_hawkes(ev, T, W)
+    for p in truth:
+        rows.append({"param": p, "est": f.estimate[p], "se": f.std_error[p]})
+mc = pd.DataFrame(rows)
+mc["covered"] = (mc.est - 1.96 * mc.se <= mc.param.map(truth)) & \
+                (mc.param.map(truth) <= mc.est + 1.96 * mc.se)
+summary = mc.groupby("param", sort=False).agg(
+    true=("param", lambda s: truth[s.iloc[0]]),
+    mean_estimate=("est", "mean"),
+    sd_of_estimates=("est", "std"),
+    mean_reported_se=("se", "mean"),
+    ci95_coverage=("covered", "mean"),
+)
+summary.round(4)
+```
+
+If the code and the maths are right, `mean_estimate` should be close to `true`,
+`sd_of_estimates` should be close to `mean_reported_se`, and coverage should be near 0.95.
+With 30 repeats, coverage between about 0.85 and 1.0 is consistent with 0.95.
+
+# 6. Caveats and next steps
+
+- **Edge effects in real data.** Here every parent lies inside the window. In a real catalogue,
+  some events are triggered by events before $t = 0$ or outside $W$. The model will count them
+  as background, which biases $\mu$ up and $K$ down. The usual fixes are a burn-in period or a
+  spatial buffer zone: events there can act as parents but are left out of the
+  $\sum\log\lambda_i$ term.
+- **Alternative fitting method.** The EM algorithm (stochastic declustering; Veen & Schoenberg,
+  2008) treats "who is whose parent" as missing data. It is often more stable for richer
+  models, such as ETAS with magnitudes.
+- **Link to the research question.** Regime-shift detection asks whether $\theta$ is constant
+  on $[0, T]$. Fitting the null model and splitting the likelihood at a candidate change time
+  $\tau$ gives the likelihood-ratio baseline. The fitted $\lambda$ also gives the Ogata-style
+  rescaled residuals that the neural detector will use as input features.
+- **The other R variants.** The power-law delay (`_temporal`), the alternative spatial kernel
+  (`_spatial`) and the inhomogeneous background (`_bg`) each change one factor of $\lambda$.
+  Each then needs a matching closed-form (or numerical) compensator.

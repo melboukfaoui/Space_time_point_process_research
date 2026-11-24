@@ -38,3 +38,6 @@ data/processed/*
 *.pt
 *.ckpt
 *.parquet
+
+/.quarto/
+**/*.quarto_ipynb

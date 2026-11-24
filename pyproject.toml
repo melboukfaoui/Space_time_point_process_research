@@ -17,6 +17,7 @@ dependencies = [
 [dependency-groups]
 dev = [
     "pytest",
+    "quarto-cli>=1.11.9",
     "ruff",
 ]
 

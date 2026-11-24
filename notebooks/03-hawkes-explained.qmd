@@ -1,0 +1,613 @@
+---
+title: "The Hawkes process, explained"
+subtitle: "Simulation, maximum-likelihood fitting, uncertainty and model checking, with every line of code explained"
+format:
+  html:
+    code-annotations: below
+    toc: true
+    toc-depth: 2
+    number-sections: true
+    html-math-method: katex
+    embed-resources: true
+    theme: cosmo
+jupyter: python3
+---
+
+This page walks through [`scripts/hawkes_basic.py`](../scripts/hawkes_basic.py) step by step.
+Every code cell below is executed, and the numbers and plots come from running it. Under each
+cell, numbered notes explain the marked lines.
+
+**Roadmap**
+
+1. The model: what a Hawkes process is.
+2. Simulation: Ogata's thinning algorithm.
+3. The likelihood: how to score parameters against data.
+4. Fitting: maximising the likelihood, plus standard errors and confidence intervals.
+5. Is the Hawkes model needed? A likelihood-ratio test against a plain Poisson process.
+6. Does the model fit? Residuals from the time-rescaling theorem.
+
+# The model
+
+## Intensity
+
+A **point process** on a time interval $[0, T]$ is a random set of event times
+$t_1 < t_2 < \dots < t_n$. Examples are earthquakes, trades and neuron spikes. We describe it by
+its **conditional intensity**, the instantaneous event rate given everything that happened
+before $t$ (the *history* $\mathcal H_t$):
+
+$$
+\lambda(t) \;=\; \lim_{dt \to 0} \frac{P(\text{an event in } [t, t + dt) \mid \mathcal H_t)}{dt}.
+$$
+
+So in a tiny interval, $P(\text{event in } [t, t+dt)) \approx \lambda(t)\,dt$.
+
+- A **Poisson process** has a constant intensity, $\lambda(t) = \mu$. Its events don't
+  influence each other.
+- A **Hawkes process** is *self-exciting*: every event temporarily raises the intensity, so
+  events tend to arrive in bursts.
+
+$$
+\boxed{\;\lambda(t) = \mu + \sum_{t_j < t} \alpha\,\beta\,e^{-\beta (t - t_j)}\;}
+$$
+
+| Parameter | Meaning |
+|---|---|
+| $\mu > 0$ | **background rate**: events per unit time that arrive "on their own" |
+| $\alpha \in [0, 1)$ | **branching ratio**: each event triggers on average $\alpha$ direct children |
+| $\beta > 0$ | **decay rate**: a triggered event follows its parent after on average $1/\beta$ time units |
+
+## Why $\alpha$ is the branching ratio
+
+The bump that event $j$ adds is $\alpha\cdot\beta e^{-\beta u}$, where $u = t - t_j$. The
+function $\beta e^{-\beta u}$ is the $\text{Exp}(\beta)$ density, so it integrates to 1:
+
+$$
+\int_0^\infty \alpha\beta e^{-\beta u}\,du = \alpha .
+$$
+
+Each event therefore adds exactly $\alpha$ expected future events: on average it has $\alpha$
+direct "children".
+
+## Clusters and the long-run event rate
+
+Every background event starts a family: it has on average $\alpha$ children, $\alpha^2$
+grandchildren, and so on. The expected family size, counting the ancestor, is
+
+$$
+1 + \alpha + \alpha^2 + \cdots = \frac{1}{1 - \alpha} \qquad (\alpha < 1).
+$$
+
+If $\alpha \ge 1$ the families never die out and the process explodes. So we need $\alpha < 1$,
+which is called *stationarity*. The long-run event rate is the background rate times the family
+size:
+
+$$
+E[\lambda(t)] = \frac{\mu}{1 - \alpha}, \qquad E[N(T)] \approx \frac{\mu T}{1 - \alpha}.
+$$
+
+## The intensity in code
+
+```{python}
+import os
+import numpy as np                                   # <1>
+import matplotlib.pyplot as plt
+from scipy.optimize import minimize                  # <2>
+from scipy.stats import chi2, kstest                 # <3>
+
+PARAM_NAMES = ["mu", "alpha", "beta"]
+
+
+def intensity(t, past, mu, alpha, beta):
+    return mu + np.sum(alpha * beta * np.exp(-beta * (t - past)))   # <4>
+```
+1. NumPy for arrays and maths. Matplotlib for plots.
+2. `minimize` is SciPy's general-purpose optimiser. We use it to maximise the likelihood.
+3. `chi2` is the chi-squared distribution, used for the likelihood-ratio test. `kstest` is the
+   Kolmogorov–Smirnov test, used to check the residuals.
+4. The boxed formula. `past` is an array of event times before `t`. `t - past` gives all the
+   lags $t - t_j$ at once, `np.exp(...)` turns each lag into its decayed bump, and `np.sum` adds
+   them up. With no past events the sum is 0 and $\lambda = \mu$.
+
+# Simulation: Ogata's thinning algorithm
+
+## The idea
+
+Simulating a Poisson process with a *constant* rate $\bar\lambda$ is easy, because the waiting
+times between events are independent $\text{Exp}(\bar\lambda)$ draws. **Thinning** (Lewis &
+Shedler, 1979; Ogata, 1981) handles a *varying* rate $\lambda(t) \le \bar\lambda$:
+
+1. Propose candidate times from the fast Poisson clock with rate $\bar\lambda$.
+2. Keep a candidate at time $t$ with probability $\lambda(t) / \bar\lambda$. Otherwise throw it
+   away.
+
+## Why it works
+
+In a tiny interval $[t, t + dt)$:
+
+$$
+P(\text{event}) = \underbrace{\bar\lambda\,dt}_{\text{a candidate appears}} \times
+\underbrace{\frac{\lambda(t)}{\bar\lambda}}_{\text{it is kept}} = \lambda(t)\,dt .
+$$
+
+That is exactly the definition of intensity $\lambda(t)$, so the kept points follow the Hawkes
+model.
+
+## Choosing the bound $\bar\lambda$
+
+Between events, every bump $e^{-\beta(t - t_j)}$ is decreasing, so $\lambda(t)$ only goes
+**down** until the next event. The intensity *right now* is therefore a valid upper bound for
+the whole stretch until the next accepted event. After each candidate, accepted or not, we
+recompute the bound from the current time.
+
+## The code
+
+```{python}
+def simulate_hawkes(mu, alpha, beta, T, seed=0):
+    if not 0 <= alpha < 1:                                   # <1>
+        raise ValueError("need 0 <= alpha < 1")
+    rng = np.random.default_rng(seed)                        # <2>
+    events = []                                              # <3>
+    t = 0.0                                                  # <4>
+    while True:
+        past = np.array(events)                              # <5>
+        lam_bar = intensity(t, past, mu, alpha, beta)        # <6>
+        t += rng.exponential(1 / lam_bar)                    # <7>
+        if t > T:                                            # <8>
+            break
+        lam_t = intensity(t, past, mu, alpha, beta)          # <9>
+        if rng.uniform() < lam_t / lam_bar:                  # <10>
+            events.append(t)                                 # <11>
+    return np.array(events)                                  # <12>
+```
+1. Refuse $\alpha \ge 1$. The process would explode (§1.3) and the loop might never end.
+2. A random-number generator. A fixed `seed` makes the simulation reproducible.
+3. The list of accepted event times, which is the history $\mathcal H_t$.
+4. The clock starts at 0.
+5. Convert the history to an array so `intensity` can work on it in one vectorised step.
+6. **The bound** $\bar\lambda = \lambda(t)$ at the current time. It is valid until the next
+   event because $\lambda$ only decays in the meantime (§2.3).
+7. **The next candidate.** Waiting time $w \sim \text{Exp}(\bar\lambda)$. NumPy's `exponential`
+   takes the *mean* $1/\bar\lambda$, not the rate. Then advance the clock by $w$.
+8. Past the end of the window: stop.
+9. The **true** intensity at the candidate time. It is lower than $\bar\lambda$ because the bumps
+   decayed while we waited.
+10. **The accept/reject step.** `rng.uniform()` is uniform on $[0, 1)$, so it is below
+    $\lambda(t)/\bar\lambda$ with exactly that probability (§2.2).
+11. Accepted: the event joins the history and will raise all future intensities.
+    Rejected: nothing is recorded, but the clock has still moved forward, and the next bound is
+    computed from there.
+12. Return the event times as an array. They are already in increasing order.
+
+## Running it
+
+```{python}
+true = {"mu": 0.5, "alpha": 0.6, "beta": 2.0}
+T = 1000
+
+times = simulate_hawkes(**true, T=T, seed=1)
+n = len(times)
+print(f"Simulated {n} events; theory mu*T/(1-alpha) = {true['mu'] * T / (1 - true['alpha']):.0f}")
+```
+
+The count matches the theory of §1.3 up to random variation.
+
+# The likelihood
+
+## Deriving it
+
+The **likelihood** is the probability (density) of the observed data, viewed as a function of
+the parameters $\theta = (\mu, \alpha, \beta)$. Good parameters make the data likely.
+
+Cut $[0, T]$ into tiny intervals of width $dt$. Given the past, each interval contains
+
+- **one event**, with probability $\approx \lambda(t)\,dt$, or
+- **no event**, with probability $\approx 1 - \lambda(t)\,dt \approx e^{-\lambda(t)\,dt}$.
+
+The probability of the whole observed sequence is the product over all intervals:
+
+$$
+\prod_{i=1}^{n} \lambda(t_i)\,dt \;\times \prod_{\text{empty intervals}} e^{-\lambda(t)\,dt}
+\;\longrightarrow\;
+\Big(\prod_{i=1}^{n} \lambda(t_i)\Big)\exp\!\Big(-\int_0^T \lambda(t)\,dt\Big)\,(dt)^n .
+$$
+
+The $(dt)^n$ factor doesn't depend on $\theta$, so we drop it. Taking logs gives the
+**log-likelihood**:
+
+$$
+\boxed{\;\ell(\theta) = \sum_{i=1}^{n} \log\lambda(t_i) \;-\; \int_0^T \lambda(t)\,dt\;}
+$$
+
+The two terms pull against each other:
+
+- $\sum \log\lambda(t_i)$ **rewards** a high intensity *at the moments events happened*.
+- $\int_0^T\lambda\,dt$ is the **expected number of events**, called the *compensator*. It
+  **penalises** a high intensity *everywhere*. Without it, the best fit would be
+  $\lambda = \infty$.
+
+## The compensator in closed form
+
+Integrate the model term by term. The constant background gives $\mu T$. Event $j$'s bump starts
+at $t_j$ and is cut off at the end of the window $T$:
+
+$$
+\int_{t_j}^{T} \alpha\beta e^{-\beta (t - t_j)}\,dt
+= \alpha\Big[-e^{-\beta (t - t_j)}\Big]_{t_j}^{T}
+= \alpha\big(1 - e^{-\beta (T - t_j)}\big).
+$$
+
+So
+
+$$
+\int_0^T\lambda(t)\,dt = \mu T + \alpha\sum_{j=1}^{n}\big(1 - e^{-\beta (T - t_j)}\big).
+$$
+
+An event close to $T$ has had little time to trigger children inside the window, so it
+contributes less than $\alpha$.
+
+## The full log-likelihood
+
+$$
+\ell(\mu, \alpha, \beta) = \sum_{i=1}^{n}\log\Big(\mu + \sum_{j<i}\alpha\beta e^{-\beta (t_i - t_j)}\Big)
+- \mu T - \alpha\sum_{j=1}^{n}\big(1 - e^{-\beta (T - t_j)}\big).
+$$
+
+## The code
+
+```{python}
+def log_likelihood(params, times, T):
+    mu, alpha, beta = params                                                  # <1>
+    log_lam = sum(np.log(intensity(ti, times[:i], mu, alpha, beta))           # <2>
+                  for i, ti in enumerate(times))
+    compensator = mu * T + alpha * np.sum(1 - np.exp(-beta * (T - times)))    # <3>
+    return log_lam - compensator                                              # <4>
+```
+1. Unpack $\theta = (\mu, \alpha, \beta)$.
+2. **First term.** Loop over the events. `enumerate` gives the index `i` and the time `ti`.
+   Because the times are sorted, `times[:i]` is exactly the set of events before $t_i$.
+   Compute $\lambda(t_i)$, take its log, and add them all up. This is $O(n^2)$ work, which is
+   fine for a few thousand events.
+3. **Second term**, the compensator from §3.2, vectorised over all events at once.
+4. $\ell(\theta) = \sum\log\lambda(t_i) - \int\lambda$.
+
+# Fitting: maximum likelihood
+
+## The maximum-likelihood estimate
+
+$$
+\hat\theta = \arg\max_\theta \ell(\theta).
+$$
+
+There is no closed-form solution, so we search numerically.
+
+**Log-parameters.** All three parameters must be positive. Instead of searching over $\theta$
+directly, we search over $\phi = \log\theta$, which can be any real number, and use
+$\theta = e^{\phi}$. This way the optimiser can never step to an impossible value such as
+$\beta < 0$.
+
+**Nelder–Mead.** This optimiser only needs function values, no derivatives. It moves a small
+triangle of points (a *simplex*) downhill until the triangle shrinks to the minimum. We minimise
+$-\ell$, which is the same as maximising $\ell$.
+
+## Standard errors from the curvature
+
+Near its maximum the log-likelihood is approximately a parabola (quadratic). How sharply it is
+curved tells us how precisely the data pin down the parameters:
+
+- **sharp peak** → small changes in $\phi$ lose a lot of likelihood → **precise** estimate;
+- **flat peak** → many values fit almost equally well → **uncertain** estimate.
+
+The curvature is measured by the **Hessian**, the matrix of second derivatives,
+$H = \nabla^2(-\ell)(\hat\phi)$, also called the *observed Fisher information*. Large-sample
+theory says the MLE is approximately normal:
+
+$$
+\hat\phi \approx N\!\big(\phi_{\text{true}},\; H^{-1}\big),
+\qquad \text{SE}(\hat\phi_k) = \sqrt{(H^{-1})_{kk}} .
+$$
+
+**Finite differences.** We approximate each second derivative from four nearby function
+values, with a small step $h$:
+
+$$
+\frac{\partial^2 f}{\partial\phi_a\,\partial\phi_b} \approx
+\frac{f(\phi + h e_a + h e_b) - f(\phi + h e_a - h e_b) - f(\phi - h e_a + h e_b) + f(\phi - h e_a - h e_b)}{4h^2}.
+$$
+
+**Delta method (back to the original scale).** Since $\theta = e^{\phi}$ and
+$d\theta/d\phi = e^{\phi} = \theta$, a small error in $\phi$ becomes $\theta$ times that error in
+$\theta$:
+
+$$
+\text{SE}(\hat\theta) \approx \hat\theta \cdot \text{SE}(\hat\phi).
+$$
+
+**95% confidence intervals.** We build them on the log scale and transform back:
+
+$$
+\Big[\,e^{\hat\phi - 1.96\,\text{SE}(\hat\phi)},\; e^{\hat\phi + 1.96\,\text{SE}(\hat\phi)}\,\Big].
+$$
+
+They are slightly asymmetric and can never go below zero. Both properties make sense for
+positive parameters.
+
+## The code
+
+```{python}
+def neg_log_likelihood_log_scale(log_params, times, T):
+    return -log_likelihood(np.exp(log_params), times, T)                       # <1>
+
+
+def numerical_hessian(f, x, h=1e-4):
+    k = len(x)                                                                 # <2>
+    H = np.zeros((k, k))
+    for a in range(k):
+        for b in range(k):
+            ea = np.eye(k)[a] * h                                              # <3>
+            eb = np.eye(k)[b] * h
+            H[a, b] = (f(x + ea + eb) - f(x + ea - eb)                         # <4>
+                       - f(x - ea + eb) + f(x - ea - eb)) / (4 * h * h)
+    return H
+
+
+def fit_hawkes(times, T):
+    n = len(times)
+    start = np.log([0.5 * n / T, 0.5, 1.0])                                    # <5>
+
+    def f(log_params):                                                         # <6>
+        return neg_log_likelihood_log_scale(log_params, times, T)
+
+    result = minimize(f, start, method="Nelder-Mead",                          # <7>
+                      options={"xatol": 1e-6, "fatol": 1e-6, "maxiter": 4000})
+    log_hat = result.x                                                         # <8>
+    estimate = np.exp(log_hat)                                                 # <9>
+
+    cov_log = np.linalg.inv(numerical_hessian(f, log_hat))                     # <10>
+    se_log = np.sqrt(np.diag(cov_log))                                         # <11>
+    se = estimate * se_log                                                     # <12>
+    ci_low = np.exp(log_hat - 1.96 * se_log)                                   # <13>
+    ci_high = np.exp(log_hat + 1.96 * se_log)
+    return estimate, se, ci_low, ci_high, -result.fun, result.success          # <14>
+```
+1. Convert log-parameters to parameters with `exp`, evaluate $\ell$, and flip the sign, because
+   optimisers *minimise*.
+2. `k` is the number of parameters (3). `H` starts as a $3\times3$ matrix of zeros.
+3. `np.eye(k)[a]` is the unit vector $e_a$ (a 1 in position `a`). Multiplying by `h` gives a
+   small step in direction $a$.
+4. The four-point finite-difference formula of §4.2 for $\partial^2 f / \partial\phi_a\partial\phi_b$.
+5. **Starting point.** The observed rate $n/T$ estimates $\mu/(1-\alpha)$ (§1.3). Guessing
+   $\alpha = 0.5$ suggests $\mu \approx 0.5\,n/T$. Take logs, because we search on the log scale.
+6. The objective as a function of the log-parameters only. The data are "baked in".
+7. Run Nelder–Mead with tight tolerances (`xatol`, `fatol`) so the optimum is found precisely.
+   That matters, because we take derivatives there next.
+8. `result.x` is the best log-parameter vector $\hat\phi$.
+9. Back to the original scale: $\hat\theta = e^{\hat\phi}$.
+10. **Covariance** of $\hat\phi$ = inverse of the Hessian of $-\ell$ at the optimum (§4.2).
+11. Standard errors of the log-parameters: square roots of the diagonal.
+12. **Delta method**: $\text{SE}(\hat\theta) = \hat\theta\cdot\text{SE}(\hat\phi)$.
+13. 95% confidence intervals, built on the log scale and exponentiated (§4.2).
+14. `result.fun` is the minimum of $-\ell$, so `-result.fun` is the maximised log-likelihood.
+    `result.success` reports whether the optimiser converged.
+
+## Results
+
+```{python}
+import pandas as pd
+
+est, se, lo, hi, ll_hawkes, ok = fit_hawkes(times, T)
+table = pd.DataFrame({
+    "true": [true[p] for p in PARAM_NAMES],
+    "estimate": est, "std. error": se, "95% CI low": lo, "95% CI high": hi,
+}, index=PARAM_NAMES)
+table["CI contains truth"] = (table["95% CI low"] <= table["true"]) & (table["true"] <= table["95% CI high"])
+print(f"max log-likelihood = {ll_hawkes:.2f}; optimiser converged: {ok}")
+table.round(3)
+```
+
+## Double-check: did we really fit the model?
+
+"The optimiser converged" is the optimiser's own claim. Here are two independent checks that
+$\hat\theta$ really is the maximum of the likelihood.
+
+**Check 1: the expected count equals the observed count.** At the MLE, the derivatives of $\ell$
+are zero. Combine two of them: $\mu\,\partial\ell/\partial\mu + \alpha\,\partial\ell/\partial\alpha$.
+Since $\lambda(t_i) = \mu + \alpha(\cdots)$ is linear in $\mu$ and $\alpha$,
+
+$$
+\mu\frac{\partial\ell}{\partial\mu} + \alpha\frac{\partial\ell}{\partial\alpha}
+= \sum_i \frac{\mu + \alpha\beta A_i}{\lambda(t_i)} - \Big(\mu T + \alpha\sum_j\big(1 - e^{-\beta(T - t_j)}\big)\Big)
+= n - \Lambda(T),
+$$
+
+where $A_i = \sum_{j<i} e^{-\beta(t_i - t_j)}$. Setting this to zero shows that **at the MLE, the
+model's expected number of events $\Lambda(T)$ must equal the observed number $n$**. If the
+optimiser had stopped early, the two would differ.
+
+**Check 2: profile curves.** Vary one parameter at a time across a range, holding the other two at
+their estimates, and plot $\ell$. If the fit is right, every curve peaks exactly at the estimate.
+
+```{python}
+mu_h, alpha_h, beta_h = est                                                      # <1>
+Lambda_T = mu_h * T + alpha_h * np.sum(1 - np.exp(-beta_h * (T - times)))         # <2>
+print(f"Observed events n = {n},  expected under the fit Lambda(T) = {Lambda_T:.3f}")
+```
+1. The fitted parameters $(\hat\mu, \hat\alpha, \hat\beta)$.
+2. $\Lambda(T)$, the compensator over the whole window at the fitted values. It is the same
+   formula as in `log_likelihood`.
+
+```{python}
+#| fig-cap: "Profile curves: the log-likelihood as one parameter varies, with the other two fixed at their estimates. Each curve peaks at the estimate (red line), so the optimiser found the maximum. The true value (dashed) lies close by, within the confidence interval."
+fig, axes = plt.subplots(1, 3, figsize=(13, 3.6))
+for k, name in enumerate(PARAM_NAMES):                                            # <1>
+    values = np.linspace(lo[k] * 0.85, hi[k] * 1.15, 31)                          # <2>
+    ll_values = []
+    for v in values:
+        params = est.copy()                                                       # <3>
+        params[k] = v                                                             # <4>
+        ll_values.append(log_likelihood(params, times, T))                        # <5>
+    axes[k].plot(values, ll_values)                                               # <6>
+    axes[k].axvline(est[k], c="red", lw=1.5, label="estimate")
+    axes[k].axvline(true[name], c="k", ls="--", lw=1, label="true")
+    axes[k].set(xlabel=name, ylabel="log-likelihood" if k == 0 else "")
+axes[0].legend()
+plt.tight_layout()
+```
+1. One panel for each parameter: $\mu$, $\alpha$, $\beta$.
+2. 31 values covering a bit more than its 95% confidence interval.
+3. Start from the fitted parameters. `.copy()` stops us from overwriting `est`.
+4. Replace only parameter `k` with the trial value `v`.
+5. Evaluate the log-likelihood there.
+6. Plot the curve and mark the estimate (red) and the true value (dashed).
+
+Both checks pass: $\Lambda(T)$ equals $n$, and every profile curve peaks at the estimate. The
+model really has been fitted.
+
+# Is the Hawkes model needed? Comparing with Poisson
+
+## The Poisson special case
+
+Set $\alpha = 0$ and the Hawkes process becomes a Poisson process with rate $\mu$. Its
+log-likelihood is $\ell = n\log\mu - \mu T$. Setting the derivative $n/\mu - T$ to zero gives
+$\hat\mu = n/T$, so the maximised value is
+
+$$
+\ell_{\text{Poisson}} = n\log(n/T) - n.
+$$
+
+## The likelihood-ratio test
+
+$$
+\text{LR} = 2\big(\ell_{\text{Hawkes}} - \ell_{\text{Poisson}}\big).
+$$
+
+If the simpler model were true, LR would roughly follow a $\chi^2$ distribution with degrees of
+freedom equal to the number of extra parameters (here 2: $\alpha$ and $\beta$). Strictly, this
+is only approximate, because $\alpha = 0$ lies on the boundary of the allowed values. A very
+large LR is decisive regardless.
+
+## AIC
+
+AIC $= 2k - 2\ell$, where $k$ is the number of parameters. It trades fit against complexity, and
+lower is better.
+
+```{python}
+ll_poisson = n * np.log(n / T) - n                                  # <1>
+lr = 2 * (ll_hawkes - ll_poisson)                                   # <2>
+p_value = chi2.sf(lr, df=2)                                         # <3>
+aic_poisson = 2 * 1 - 2 * ll_poisson                                # <4>
+aic_hawkes = 2 * 3 - 2 * ll_hawkes
+print(f"LR = {lr:.1f}, p-value ~ {p_value:.2g}")
+print(f"AIC: Poisson = {aic_poisson:.1f}, Hawkes = {aic_hawkes:.1f}")
+```
+1. The Poisson log-likelihood at its MLE $\hat\mu = n/T$ (§5.1).
+2. The likelihood-ratio statistic.
+3. `chi2.sf` is the survival function $P(\chi^2_2 > \text{LR})$, i.e. the p-value.
+4. AIC for each model: 1 parameter for Poisson, 3 for Hawkes.
+
+The Hawkes model wins by a huge margin: the events really do excite each other.
+
+# Does the model fit? The time-rescaling theorem
+
+A good likelihood score doesn't prove the model is *right*, only that it beats the alternatives
+we tried. To check the fit itself, we use a classic result.
+
+## The theorem
+
+Define the compensator up to time $t$:
+
+$$
+\Lambda(t) = \int_0^t \lambda(s)\,ds.
+$$
+
+**Time-rescaling theorem.** If $\lambda$ is the true intensity, the transformed times
+$\Lambda(t_1), \Lambda(t_2), \dots$ form a **Poisson process with rate 1**. So the *rescaled
+gaps*
+
+$$
+r_i = \Lambda(t_i) - \Lambda(t_{i-1})
+$$
+
+are independent $\text{Exp}(1)$ draws.
+
+**Intuition.** $\Lambda$ stretches time where the intensity is high and squeezes it where it is
+low, until events arrive at a constant rate of 1. If the fitted model is wrong, the stretching is
+wrong and the gaps won't look $\text{Exp}(1)$.
+
+For our model, using the same integral as §3.2 but stopping at $t_i$:
+
+$$
+\Lambda(t_i) = \mu t_i + \alpha\sum_{j<i}\big(1 - e^{-\beta (t_i - t_j)}\big).
+$$
+
+We compare the $r_i$ with $\text{Exp}(1)$ in two ways:
+
+- a **QQ plot**: sorted gaps against Exp(1) quantiles $-\log(1 - p)$, which should lie on the
+  diagonal;
+- a **Kolmogorov–Smirnov test**, where a large p-value means no evidence against the model.
+
+## The code
+
+```{python}
+def rescaled_gaps(times, mu, alpha, beta):
+    Lam = np.array([
+        mu * ti + alpha * np.sum(1 - np.exp(-beta * (ti - times[:i])))     # <1>
+        for i, ti in enumerate(times)
+    ])
+    return np.diff(Lam, prepend=0.0)                                        # <2>
+
+
+gaps = rescaled_gaps(times, *est)                                           # <3>
+gaps_poisson = np.diff(times * n / T, prepend=0.0)                          # <4>
+p_hawkes = kstest(gaps, "expon").pvalue                                     # <5>
+p_poisson = kstest(gaps_poisson, "expon").pvalue
+print(f"KS test vs Exp(1): Hawkes p = {p_hawkes:.3f}, Poisson p = {p_poisson:.2g}")
+```
+1. $\Lambda(t_i)$ from the formula above: background $\mu t_i$ plus the integrated bumps of all
+   earlier events.
+2. Gaps between consecutive values, starting from $\Lambda(0) = 0$.
+3. Residuals under the **fitted** Hawkes parameters. `*est` unpacks
+   $(\hat\mu, \hat\alpha, \hat\beta)$.
+4. Residuals under the Poisson fit. Its compensator is simply $\Lambda(t) = (n/T)\,t$.
+5. Kolmogorov–Smirnov test of each set of gaps against $\text{Exp}(1)$.
+
+## Plots
+
+```{python}
+#| fig-cap: "Left: the fitted intensity over the first 50 time units. Each event (black tick) makes it jump by alpha*beta, and it then decays back towards mu, so events arrive in bursts. Right: QQ plot of the rescaled gaps. The Hawkes residuals lie on the diagonal (good fit). The Poisson residuals bend away, because a constant rate can't explain the bursts: it has too many tiny gaps and too many huge ones."
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4.2))
+
+grid = np.linspace(0, 50, 2000)                                                   # <1>
+window = times[times <= 50]
+ax1.plot(grid, [intensity(g, window[window < g], *est) for g in grid], label="fitted λ(t)")  # <2>
+ax1.plot(window, np.zeros_like(window), "|", ms=12, c="k", label="events")        # <3>
+ax1.axhline(est[0], ls="--", c="grey", lw=1, label="fitted μ")
+ax1.set(xlabel="time", ylabel="intensity", title="Fitted intensity")
+ax1.legend()
+
+q = -np.log(1 - (np.arange(1, n + 1) - 0.5) / n)                                  # <4>
+ax2.plot(q, np.sort(gaps), ".", ms=3, label="Hawkes fit")                         # <5>
+ax2.plot(q, np.sort(gaps_poisson), ".", ms=3, label="Poisson fit")
+ax2.plot([0, q.max()], [0, q.max()], c="grey", lw=1)                              # <6>
+ax2.set(xlabel="Exp(1) quantiles", ylabel="rescaled gaps", title="Residual QQ plot")
+ax2.legend()
+plt.tight_layout()
+```
+1. A fine time grid over $[0, 50]$, and the events that fall in it.
+2. Evaluate the fitted $\lambda(t)$ at each grid point, using only the events before that point.
+3. Draw the events as tick marks along the bottom.
+4. Theoretical $\text{Exp}(1)$ quantiles: the inverse CDF $-\log(1 - p)$ at evenly spaced
+   probabilities $p = (i - 0.5)/n$.
+5. Plot the sorted residuals against those quantiles.
+6. The diagonal: where the points should lie if the model is right.
+
+# Summary
+
+| Step | Mathematics | Result here |
+|---|---|---|
+| Model | $\lambda(t) = \mu + \sum_{t_j<t}\alpha\beta e^{-\beta(t-t_j)}$ | branching ratio $\alpha$, mean rate $\mu/(1-\alpha)$ |
+| Simulation | thinning: keep candidates with probability $\lambda(t)/\bar\lambda$ | `{python} n` events (theory: 1250) |
+| Likelihood | $\ell = \sum\log\lambda(t_i) - \int_0^T\lambda$ | closed-form compensator |
+| Fit | $\hat\theta = \arg\max\ell$ on the log scale | all three 95% CIs contain the truth |
+| Uncertainty | $\text{Cov} \approx H^{-1}$, $\text{SE}(\theta) \approx \theta\,\text{SE}(\log\theta)$ | see the results table |
+| vs Poisson | $\text{LR} = 2(\ell_H - \ell_P)$, AIC | LR = `{python} f"{lr:.0f}"`, Hawkes strongly preferred |
+| Model check | $\Lambda(t_i) - \Lambda(t_{i-1}) \sim \text{Exp}(1)$ | KS p = `{python} f"{p_hawkes:.2f}"` (Hawkes) vs `{python} f"{p_poisson:.1g}"` (Poisson) |

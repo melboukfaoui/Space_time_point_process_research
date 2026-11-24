@@ -1,0 +1,429 @@
+---
+title: "Temporal Hawkes process: simulation by thinning, fitting by maximum likelihood"
+format:
+  html:
+    code-annotations: below
+    toc: true
+    html-math-method: katex
+jupyter: python3
+---
+
+This notebook builds a Hawkes process from scratch, independently of Robert's branching
+simulator, and fits it. The code lives in
+[`src/stpp/hawkes_temporal.py`](../src/stpp/hawkes_temporal.py).
+
+| | Notebook 01 (Robert's approach) | This notebook |
+|---|---|---|
+| Dimensions | space and time | time only |
+| Simulation | branching: build family trees | **Ogata thinning**: follow the intensity forward in time |
+| Likelihood cost | $O(n^2)$, all pairs | **$O(n)$**, by a recursion |
+| Gradient | finite differences | **exact**, by a second recursion |
+| Model check | parameter recovery | parameter recovery, **time-rescaling residuals**, and a **test against Poisson** |
+
+# 1. The model
+
+Event times $0 < t_1 < t_2 < \dots < t_n \le T$. The conditional intensity is
+
+$$
+\lambda(t) = \mu + \sum_{t_j < t} \alpha\,\beta\, e^{-\beta (t - t_j)}.
+$$
+
+- $\mu$: the background rate.
+- $\alpha$: the **branching ratio**. The kernel $\beta e^{-\beta u}$ integrates to 1, so each
+  event triggers on average $\alpha$ direct children.
+- $\beta$: the decay rate. The average delay from parent to child is $1/\beta$.
+
+Each event makes $\lambda$ **jump up by $\alpha\beta$**, and between events $\lambda$
+**decays exponentially back towards $\mu$**. Events make more events, which produces clusters.
+The process is stationary only if $\alpha < 1$. Its long-run event rate is
+$E[\lambda] = \mu / (1 - \alpha)$: $\mu$ immigrants per unit time, each bringing on average
+$1/(1-\alpha)$ events including itself.
+
+# 2. Simulation by thinning
+
+## The idea
+
+To simulate a Poisson process with *constant* rate $\bar\lambda$, draw
+$\text{Exp}(\bar\lambda)$ waiting times. **Thinning** (Lewis–Shedler; Ogata, 1981) handles a
+*varying* rate $\lambda(t) \le \bar\lambda$:
+
+1. Propose candidate points from a Poisson process with the larger rate $\bar\lambda$.
+2. Keep a candidate at time $t$ with probability $\lambda(t)/\bar\lambda$.
+
+**Why it works.** In a tiny interval $dt$, a candidate appears with probability
+$\bar\lambda\,dt$ and is kept with probability $\lambda(t)/\bar\lambda$. So an event occurs with
+probability $\bar\lambda\,dt \cdot \lambda(t)/\bar\lambda = \lambda(t)\,dt$, which is exactly the
+target intensity.
+
+**Finding a bound for a Hawkes process.** Between events, $\lambda(t)$ only *decreases*. So
+the intensity right now is an upper bound until the next event. Each time we accept a point,
+$\lambda$ jumps up and we take a new bound. Rejected candidates still help: they move the
+clock forward, and the bound is reset at each one.
+
+## The code, line by line
+
+```{.python}
+def simulate_hawkes_thinning(mu, alpha, beta, T, seed=None):
+    if not 0 <= alpha < 1:                                    # <1>
+        raise ValueError("alpha must be in [0, 1) ...")
+    rng = np.random.default_rng(seed)                         # <2>
+    events = []                                               # <3>
+    t = 0.0                                                   # <4>
+    excitation = 0.0                                          # <5>
+
+    while True:
+        lam_bar = mu + excitation                             # <6>
+        w = rng.exponential(1 / lam_bar)                      # <7>
+        t += w                                                # <8>
+        if t > T:                                             # <9>
+            break
+        excitation *= np.exp(-beta * w)                       # <10>
+        lam_t = mu + excitation                               # <11>
+        if rng.uniform() * lam_bar <= lam_t:                  # <12>
+            events.append(t)                                  # <13>
+            excitation += alpha * beta                        # <14>
+    return np.array(events)
+```
+1. Refuse $\alpha \ge 1$. The process would explode and the loop might never reach $T$.
+2. A seeded random-number generator, so a simulation can be reproduced.
+3. The accepted event times.
+4. The clock. It moves forward through candidate times.
+5. The **state variable**: $E(t) = \sum_{t_j<t}\alpha\beta e^{-\beta(t-t_j)}$, so that
+   $\lambda(t) = \mu + E(t)$. Because the kernel is exponential, we never need to revisit past
+   events. $E$ just decays by a factor $e^{-\beta w}$ over a gap $w$ and jumps by $\alpha\beta$
+   at each event. This is the *Markov property* of the exponential Hawkes process, and it makes
+   the simulator $O(n)$.
+6. The **bound** $\bar\lambda$. It equals the current intensity, which can only fall until the
+   next accepted event.
+7. A **candidate waiting time** from a Poisson clock with rate $\bar\lambda$:
+   $w \sim \text{Exp}(\bar\lambda)$. NumPy takes the mean $1/\bar\lambda$.
+8. Move the clock to the candidate time.
+9. Past the end of the window: stop.
+10. Decay the excitation from the old time to the candidate time: $E \leftarrow E\,e^{-\beta w}$.
+11. The **true intensity** at the candidate time.
+12. **Accept with probability $\lambda(t)/\bar\lambda$.** `uniform() * lam_bar` is uniform on
+    $[0, \bar\lambda]$, and it falls below $\lambda(t)$ with exactly that probability. If the
+    candidate is rejected we just continue: $\bar\lambda$ is recomputed from the now lower
+    intensity, so the bound gets tighter.
+13. Accepted: record the event.
+14. The new event adds its own bump: $\lambda$ jumps by $\alpha\beta$, which is the kernel's
+    value at lag 0.
+
+## Running it
+
+```{python}
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy.stats import kstest, chi2
+from stpp.hawkes_temporal import (simulate_hawkes_thinning, fit_hawkes_temporal,
+                                  compensator_at_events)
+
+truth = {"mu": 0.5, "alpha": 0.6, "beta": 2.0}
+T = 2000.0
+times = simulate_hawkes_thinning(**truth, T=T, seed=0)
+print(f"{len(times)} events; theory mu*T/(1-alpha) = {truth['mu'] * T / (1 - truth['alpha']):.0f}")
+```
+
+```{python}
+def intensity(grid, times, mu, alpha, beta):
+    lam = np.full_like(grid, mu)
+    for tj in times:
+        after = grid > tj
+        lam[after] += alpha * beta * np.exp(-beta * (grid[after] - tj))
+    return lam
+```
+
+```{python}
+#| fig-cap: "The first 60 time units. Each event (tick at the bottom) makes the intensity jump by alpha*beta, and it then decays back towards mu (dashed line). Events arrive in bursts."
+grid = np.linspace(0, 60, 3000)
+window = times[times <= 60]
+fig, ax = plt.subplots(figsize=(10, 3.5))
+ax.plot(grid, intensity(grid, window, **truth), lw=1)
+ax.axhline(truth["mu"], ls="--", c="grey", lw=1)
+ax.plot(window, np.zeros_like(window), "|", ms=14, c="k")
+ax.set(xlabel="time", ylabel="λ(t)", title="True intensity and simulated events")
+plt.tight_layout()
+```
+
+# 3. The mathematics of fitting
+
+## 3.1 The log-likelihood
+
+For any point process on $[0, T]$:
+
+$$
+\ell(\theta) = \sum_{i=1}^n \log\lambda(t_i) - \int_0^T \lambda(t)\,dt.
+$$
+
+Notebook 01 (§3.1) derives this in detail. The first term rewards a high intensity where events
+happened. The integral (the **compensator**) is the expected number of events, and it penalises a
+high intensity everywhere.
+
+## 3.2 The first term in $O(n)$
+
+Define
+
+$$
+A_i = \sum_{j<i} e^{-\beta (t_i - t_j)}, \qquad \lambda(t_i) = \mu + \alpha\beta A_i.
+$$
+
+Computed directly, $A_i$ needs every earlier event, which makes $O(n^2)$ work in total. Split
+the lag $t_i - t_j = (t_i - t_{i-1}) + (t_{i-1} - t_j)$ to get a **recursion**:
+
+$$
+A_i = e^{-\beta (t_i - t_{i-1})}\Big(\underbrace{1}_{j = i-1} + \underbrace{A_{i-1}}_{j < i-1}\Big),
+\qquad A_1 = 0.
+$$
+
+Each step is $O(1)$, so all the $A_i$ cost $O(n)$. This is the same Markov property the
+simulator uses.
+
+## 3.3 The compensator
+
+Integrate each term:
+
+$$
+\int_0^T \lambda(t)\,dt = \mu T + \sum_{j=1}^n \alpha \int_{t_j}^{T} \beta e^{-\beta(t-t_j)}dt
+= \mu T + \alpha \sum_{j=1}^n \big(1 - e^{-\beta (T - t_j)}\big).
+$$
+
+An event near $T$ has had little time to trigger children, so it contributes less than
+$\alpha$.
+
+Putting §3.2 and §3.3 together:
+
+$$
+\boxed{\;\ell(\mu,\alpha,\beta) = \sum_{i=1}^n \log\big(\mu + \alpha\beta A_i\big) - \mu T
+- \alpha\sum_{j=1}^n\big(1 - e^{-\beta(T - t_j)}\big)\;}
+$$
+
+## 3.4 The exact gradient
+
+Optimisers converge faster and more reliably with the true gradient than with finite
+differences. Write $\lambda_i = \mu + \alpha\beta A_i$ and $D_j = e^{-\beta(T - t_j)}$.
+
+$$
+\frac{\partial\ell}{\partial\mu} = \sum_i \frac{1}{\lambda_i} - T,
+\qquad
+\frac{\partial\ell}{\partial\alpha} = \sum_i \frac{\beta A_i}{\lambda_i} - \sum_j (1 - D_j),
+$$
+$$
+\frac{\partial\ell}{\partial\beta} = \sum_i \frac{\alpha (A_i + \beta B_i)}{\lambda_i}
+- \alpha\sum_j (T - t_j) D_j,
+\qquad
+B_i = \frac{\partial A_i}{\partial\beta} = -\sum_{j<i}(t_i - t_j)\,e^{-\beta(t_i - t_j)}.
+$$
+
+$B_i$ also has an $O(n)$ recursion. With $\Delta_i = t_i - t_{i-1}$, use the same lag split:
+
+$$
+B_i = e^{-\beta\Delta_i}\big(B_{i-1} - \Delta_i (1 + A_{i-1})\big).
+$$
+
+We optimise over $\phi = \log\theta$, so the gradient is converted with the chain rule:
+$\partial\ell/\partial\phi_k = \theta_k\,\partial\ell/\partial\theta_k$.
+
+## 3.5 Standard errors
+
+These work as in notebook 01:
+$\widehat{\text{Cov}}(\hat\phi) = [\nabla^2(-\ell)(\hat\phi)]^{-1}$ (the inverse observed
+information), then the delta method $\text{SE}(\hat\theta) = \hat\theta\cdot\text{SE}(\hat\phi)$.
+
+## 3.6 Checking the fit: the time-rescaling theorem
+
+Fitting always returns *some* parameters. To check that the model is actually right, use the
+**time-rescaling theorem**. If $\lambda$ is the true intensity, transform each event time by the
+compensator,
+
+$$
+\tau_i = \Lambda(t_i) = \int_0^{t_i}\lambda(s)\,ds.
+$$
+
+The transformed times $\tau_i$ then form a Poisson process with rate 1. In other words, the gaps
+$\tau_i - \tau_{i-1}$ are independent $\text{Exp}(1)$ draws. If the fitted model is wrong, the
+gaps won't look exponential, and a QQ plot or a Kolmogorov–Smirnov test will show it.
+
+$\Lambda(t_i)$ also has an $O(n)$ formula. Before $t_i$ there are $i-1$ events, each
+contributing $\alpha(1 - e^{-\beta(t_i - t_j)})$:
+
+$$
+\Lambda(t_i) = \mu t_i + \alpha\big((i-1) - A_i\big).
+$$
+
+These gaps are the "Ogata-style residuals" in the research plan.
+
+# 4. The fitting code, line by line
+
+```{.python}
+def _recursion(times, beta, with_derivative=False):
+    n = len(times)
+    A = np.zeros(n)                                                     # <1>
+    B = np.zeros(n)
+    gaps = np.diff(times)                                               # <2>
+    decay = np.exp(-beta * gaps)                                        # <3>
+    for i in range(1, n):
+        A[i] = decay[i - 1] * (1.0 + A[i - 1])                          # <4>
+        if with_derivative:
+            B[i] = decay[i - 1] * (B[i - 1] - gaps[i - 1] * (1.0 + A[i - 1]))  # <5>
+    return (A, B) if with_derivative else A
+```
+1. $A_1 = 0$ and $B_1 = 0$: the first event has no predecessors. (Python counts from 0, so this
+   is index 0.)
+2. $\Delta_i = t_i - t_{i-1}$ for every $i$.
+3. $e^{-\beta\Delta_i}$, computed for all $i$ at once.
+4. The recursion of §3.2: $A_i = e^{-\beta\Delta_i}(1 + A_{i-1})$.
+5. The recursion of §3.4: $B_i = e^{-\beta\Delta_i}(B_{i-1} - \Delta_i(1 + A_{i-1}))$.
+
+```{.python}
+def neg_log_likelihood_and_grad(theta, times, T):
+    mu, alpha, beta = np.exp(theta)                                     # <1>
+    A, B = _recursion(times, beta, with_derivative=True)                # <2>
+    lam = mu + alpha * beta * A                                         # <3>
+    tail = np.exp(-beta * (T - times))                                  # <4>
+    ll = np.sum(np.log(lam)) - mu * T - alpha * np.sum(1.0 - tail)      # <5>
+
+    d_mu = np.sum(1.0 / lam) - T                                        # <6>
+    d_alpha = np.sum(beta * A / lam) - np.sum(1.0 - tail)               # <6>
+    d_beta = np.sum(alpha * (A + beta * B) / lam) \
+             - alpha * np.sum((T - times) * tail)                       # <6>
+    grad_log = np.array([mu * d_mu, alpha * d_alpha, beta * d_beta])    # <7>
+    return -ll, -grad_log                                               # <8>
+```
+1. The optimiser works on $\log\theta$, which keeps all three parameters positive.
+2. $A_i$ and $B_i$ for every event, in one $O(n)$ pass.
+3. $\lambda(t_i) = \mu + \alpha\beta A_i$ at every event.
+4. $D_j = e^{-\beta(T - t_j)}$: the share of each event's triggering that would fall after $T$.
+5. The boxed log-likelihood of §3.3.
+6. The three partial derivatives of §3.4.
+7. Chain rule to the log scale: multiply each by its parameter.
+8. Return the negative value and gradient, because `minimize` minimises.
+
+```{.python}
+def fit_hawkes_temporal(times, T, start=None):
+    if start is None:
+        start = (0.5 * len(times) / T, 0.5, 1.0)                        # <1>
+
+    def f(theta):
+        return neg_log_likelihood(theta, times, T)                      # <2>
+
+    def f_and_grad(theta):
+        return neg_log_likelihood_and_grad(theta, times, T)
+
+    res = minimize(f_and_grad, np.log(start), jac=True, method="BFGS")  # <3>
+    est = np.exp(res.x)                                                 # <4>
+    cov_log = np.linalg.inv(_numerical_hessian(f, res.x))               # <5>
+    se = est * np.sqrt(np.diag(cov_log))                                # <6>
+    ...
+```
+1. Starting values. The observed rate $n/T$ estimates $\mu/(1-\alpha)$, so assuming
+   $\alpha = 0.5$ suggests $\mu \approx 0.5\,n/T$.
+2. Value only. Used for the Hessian.
+3. BFGS on $-\ell$. `jac=True` tells SciPy that our function returns the value and the exact
+   gradient together.
+4. Back to the original scale.
+5. Inverse of the Hessian of $-\ell$ at the optimum = covariance of $\log\hat\theta$ (§3.5).
+6. Delta method to get standard errors on the original scale.
+
+```{.python}
+def compensator_at_events(times, mu, alpha, beta):
+    A = _recursion(times, beta)                                         # <1>
+    return mu * times + alpha * (np.arange(len(times)) - A)             # <2>
+```
+1. Reuse the $A_i$ recursion.
+2. $\Lambda(t_i) = \mu t_i + \alpha((i-1) - A_i)$ from §3.6. `np.arange` gives
+   $0, 1, 2, \dots$, which is the number of earlier events in Python's 0-based counting.
+
+# 5. Fitting the simulated data
+
+```{python}
+fit = fit_hawkes_temporal(times, T)
+print(fit.summary(truth))
+```
+
+## Is the Hawkes model needed? A test against Poisson
+
+The Poisson model is the special case $\alpha = 0$, with MLE $\hat\mu = n/T$ and log-likelihood
+$n\log(n/T) - n$. The **likelihood-ratio statistic** $2(\ell_{\text{Hawkes}} -
+\ell_{\text{Poisson}})$ measures how much better the Hawkes model fits.
+
+```{python}
+n = len(times)
+ll_pois = n * np.log(n / T) - n
+lr = 2 * (fit.log_likelihood - ll_pois)
+aic = {"Poisson": 2 * 1 - 2 * ll_pois, "Hawkes": 2 * 3 - 2 * fit.log_likelihood}
+print(f"LR statistic = {lr:.1f}")
+print(f"AIC: Poisson {aic['Poisson']:.1f}, Hawkes {aic['Hawkes']:.1f} (lower is better)")
+```
+
+$\alpha = 0$ lies on the edge of the parameter space, so the usual $\chi^2$ reference
+distribution is only approximate here. That doesn't matter: a statistic this large is decisive
+evidence of self-excitation.
+
+## Goodness of fit with rescaled residuals
+
+```{python}
+#| fig-cap: "Left: QQ plot of the rescaled gaps against Exp(1). Under the fitted Hawkes model they lie on the diagonal; under a Poisson fit they bend away, because the Poisson model can't explain the bursts. Right: rescaled time against event number. It should be a straight line of slope 1."
+tau_h = compensator_at_events(times, **fit.estimate)
+gaps_h = np.diff(tau_h, prepend=0.0)
+gaps_p = np.diff(times * n / T, prepend=0.0)  # Poisson compensator is (n/T) t
+
+probs = (np.arange(1, n + 1) - 0.5) / n
+theo = -np.log(1 - probs)
+fig, axes = plt.subplots(1, 2, figsize=(10, 4.2))
+axes[0].plot(theo, np.sort(gaps_h), ".", ms=3, label="Hawkes fit")
+axes[0].plot(theo, np.sort(gaps_p), ".", ms=3, label="Poisson fit")
+axes[0].plot([0, theo.max()], [0, theo.max()], c="grey", lw=1)
+axes[0].set(xlabel="Exp(1) quantiles", ylabel="rescaled gaps", title="QQ plot")
+axes[0].legend()
+axes[1].plot(np.arange(1, n + 1), tau_h, lw=1)
+axes[1].plot([0, n], [0, n], c="grey", ls="--", lw=1)
+axes[1].set(xlabel="event number i", ylabel="Λ(t_i)", title="Rescaled time")
+plt.tight_layout()
+
+print(f"KS test vs Exp(1): Hawkes p = {kstest(gaps_h, 'expon').pvalue:.3f}, "
+      f"Poisson p = {kstest(gaps_p, 'expon').pvalue:.2g}")
+```
+
+A large p-value for the Hawkes fit means no evidence against it. The Poisson fit is rejected
+outright.
+
+## Repeated simulations: bias, standard errors, coverage
+
+```{python}
+rows = []
+for seed in range(1, 101):
+    ts = simulate_hawkes_thinning(**truth, T=T, seed=seed)
+    f = fit_hawkes_temporal(ts, T)
+    for p, true in truth.items():
+        est, se = f.estimate[p], f.std_error[p]
+        rows.append({"param": p, "true": true, "est": est, "se": se,
+                     "covered": abs(est - true) <= 1.96 * se})
+mc = pd.DataFrame(rows)
+mc.groupby("param", sort=False).agg(
+    true=("true", "first"),
+    mean_estimate=("est", "mean"),
+    sd_of_estimates=("est", "std"),
+    mean_reported_se=("se", "mean"),
+    ci95_coverage=("covered", "mean"),
+).round(4)
+```
+
+Over 100 repeats, the mean estimate should be close to the truth, the reported standard error
+should be close to the actual spread of the estimates, and coverage should be close to 0.95.
+With 100 repeats, anything from about 0.90 to 0.99 is consistent with 0.95.
+
+# 6. Where this goes next
+
+- **Regime shifts.** Let $(\mu, \alpha, \beta)$ switch at an unknown time $\tau$. The
+  likelihood-ratio scan
+  $\max_\tau\,[\ell(\hat\theta_{[0,\tau]}) + \ell(\hat\theta_{(\tau,T]}) - \ell(\hat\theta_{[0,T]})]$
+  is the classical baseline the neural detector must beat. The $O(n)$ likelihood makes the scan
+  cheap.
+- **Residuals as features.** The rescaled gaps $\Lambda(t_i) - \Lambda(t_{i-1})$ are about
+  $\text{Exp}(1)$ under "no change". Departures from that are what a detector should pick up.
+- **Order books.** Buy and sell market orders form a 2-dimensional Hawkes process with
+  cross-excitation $\alpha_{\text{buy}\to\text{sell}}$, etc. It's the same thinning and the same
+  recursion, run per pair of event types.
+- **Space.** Adding a spatial kernel gives notebook 01's model. The recursion no longer applies
+  directly, because the spatial weights differ for every pair.

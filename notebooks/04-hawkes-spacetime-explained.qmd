@@ -1,0 +1,570 @@
+---
+title: "The space-time Hawkes process, explained"
+subtitle: "Simulation, maximum-likelihood fitting, uncertainty, and model checking in space and time, with every line of code explained"
+format:
+  html:
+    code-annotations: below
+    toc: true
+    toc-depth: 2
+    number-sections: true
+    html-math-method: katex
+    embed-resources: true
+    theme: cosmo
+jupyter: python3
+---
+
+This page walks through [`scripts/hawkes_spacetime.py`](../scripts/hawkes_spacetime.py). It is
+the space-time version of the time-only page (notebook 03), with the same structure. Every code
+cell is executed, and the numbered notes under each cell explain the marked lines.
+
+**What changes when we add space**
+
+| | Time only | Space-time |
+|---|---|---|
+| An event | a time $t_i$ | a time and a place $(t_i, x_i, y_i)$ |
+| Intensity | events per unit time | events per unit time **per unit area** |
+| Triggering | each event raises the rate *soon after* | each event raises the rate *soon after and nearby* |
+| Parameters | $\mu, \alpha, \beta$ | $\mu, K, \beta$, plus **$\sigma$** (spatial spread) |
+| Compensator | time edge effect at $T$ | time edge effect at $T$ **and** space edge effect at the border of $W$ |
+| Model check | time residuals | time residuals **are weak**, so add a **space-time** check |
+
+# The model
+
+## Intensity
+
+Events happen at times in $[0, T]$ and places in a rectangle
+$W = [x_{\min}, x_{\max}] \times [y_{\min}, y_{\max}]$. The conditional intensity is now a rate
+per unit time per unit area:
+
+$$
+P\big(\text{event in } [t, t+dt) \times [x, x+dx) \times [y, y+dy) \mid \mathcal H_t\big)
+\approx \lambda(t, x, y)\,dt\,dx\,dy .
+$$
+
+The space-time Hawkes model is
+
+$$
+\boxed{\;\lambda(t, x, y) = \mu + \sum_{t_j < t} K\;
+\underbrace{\beta e^{-\beta (t - t_j)}}_{g(t - t_j):\ \text{when}}\;
+\underbrace{\frac{1}{2\pi\sigma^2}\exp\!\Big(-\frac{(x - x_j)^2 + (y - y_j)^2}{2\sigma^2}\Big)}_{f(x - x_j,\ y - y_j):\ \text{where}}\;}
+$$
+
+| Parameter | Meaning |
+|---|---|
+| $\mu$ | **background rate** per unit time per unit area. Background events are spread uniformly over $W$. |
+| $K \in [0, 1)$ | **branching ratio**: expected number of direct children of each event |
+| $\beta$ | **temporal decay**: a child follows its parent after on average $1/\beta$ time units |
+| $\sigma$ | **spatial spread**: a child lands a $N(0, \sigma^2)$ distance from its parent in each of $x$ and $y$ |
+
+## Why $K$ is the branching ratio
+
+$g(u) = \beta e^{-\beta u}$ is the $\text{Exp}(\beta)$ density, and $f$ is the density of two
+independent $N(0, \sigma^2)$ coordinates. Each integrates to 1, so the total mass of event $j$'s
+bump over all future time and the whole plane is
+
+$$
+\int_0^\infty\!\!\int\!\!\int_{\mathbb R^2} K\,g(u)\,f(a, b)\,da\,db\,du = K \cdot 1 \cdot 1 = K .
+$$
+
+As in the time-only model, the expected cluster size is $1/(1 - K)$, so we need $K < 1$. Over
+the whole plane the expected count would be $\mu|W|T/(1-K)$. In the window the count is a little
+lower, because some children land outside $W$.
+
+**Space-time "separability".** The bump is a product of a time part and a space part. "When" a
+child arrives is independent of "where" it lands. This makes the integrals below factorise
+neatly.
+
+## The model in code
+
+```{python}
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy.optimize import minimize
+from scipy.stats import chi2, kstest, norm                              # <1>
+
+PARAM_NAMES = ["mu", "K", "beta", "sigma"]
+
+
+def intensity(t, x, y, past, mu, K, beta, sigma):
+    dt = t - past[:, 0]                                                 # <2>
+    d2 = (x - past[:, 1]) ** 2 + (y - past[:, 2]) ** 2                  # <3>
+    when = beta * np.exp(-beta * dt)                                    # <4>
+    where = np.exp(-d2 / (2 * sigma**2)) / (2 * np.pi * sigma**2)       # <5>
+    return mu + np.sum(K * when * where)                                # <6>
+
+
+def spatial_share(x, y, sigma, W):
+    xmin, xmax, ymin, ymax = W
+    px = norm.cdf((xmax - x) / sigma) - norm.cdf((xmin - x) / sigma)    # <7>
+    py = norm.cdf((ymax - y) / sigma) - norm.cdf((ymin - y) / sigma)
+    return px * py                                                      # <8>
+```
+1. `norm` is the normal distribution. We need its CDF $\Phi$ for the spatial edge correction.
+   `chi2` and `kstest` are for the model checks.
+2. `past` is an $m \times 3$ array of earlier events, with columns $t, x, y$. `t - past[:, 0]`
+   gives every time lag $t - t_j$ at once.
+3. Every squared distance $(x - x_j)^2 + (y - y_j)^2$.
+4. The "when" factor, $g(t - t_j) = \beta e^{-\beta(t - t_j)}$, for every past event.
+5. The "where" factor, the 2-D Gaussian density $f$. The $1/(2\pi\sigma^2)$ makes it integrate to
+   1.
+6. $\lambda = \mu + \sum_j K\,g\,f$. With no past events the sum is 0 and $\lambda = \mu$.
+7. The share of a Gaussian centred at $x_j$ that falls inside $[x_{\min}, x_{\max}]$:
+   $P(x_{\min} < X < x_{\max}) = \Phi\big(\tfrac{x_{\max} - x_j}{\sigma}\big) - \Phi\big(\tfrac{x_{\min} - x_j}{\sigma}\big)$.
+   The same is done for $y$.
+8. $x$ and $y$ are independent, so the share inside the rectangle is the product. This is used
+   in §3.2.
+
+# Simulation: thinning in space and time
+
+## Splitting the process by source
+
+Think of every event as coming from a **source**:
+
+- the **background**, which produces events at rate $\mu|W|$ (per unit time, anywhere in $W$),
+  with a uniform location;
+- **past event $j$**, which produces children at rate $K\beta e^{-\beta(t - t_j)}$ (per unit
+  time, anywhere in the plane), with location $(x_j, y_j) + N(0, \sigma^2 I)$.
+
+Adding up all sources, candidates appear at the total rate
+
+$$
+R(t) = \mu|W| + \sum_{t_j < t} K\beta e^{-\beta (t - t_j)} .
+$$
+
+## The algorithm
+
+$R(t)$ only **decreases** between events, so its current value $\bar R$ bounds it until the next
+event, just as in the time-only case. Each loop does four things:
+
+1. **Candidate time.** Wait $w \sim \text{Exp}(\bar R)$.
+2. **Time thinning.** Keep the candidate with probability $R(t)/\bar R$.
+3. **Pick the source.** Choose the background with probability $\mu|W|/R(t)$, or event $j$ with
+   probability $K\beta e^{-\beta(t - t_j)}/R(t)$. Draw the location from that source.
+4. **Spatial thinning.** If the location falls outside $W$, the event would not be observed, so
+   drop it.
+
+## Why this gives exactly $\lambda(t, x, y)$
+
+Follow a small cell $dt \times dA$ at $(t, x, y)$ inside $W$:
+
+$$
+\underbrace{\bar R\,dt}_{\text{candidate}}\cdot
+\underbrace{\frac{R(t)}{\bar R}}_{\text{kept}}\cdot
+\Big[\frac{\mu|W|}{R(t)}\cdot\frac{dA}{|W|} + \sum_j \frac{K\beta e^{-\beta(t - t_j)}}{R(t)}\cdot f(x - x_j, y - y_j)\,dA\Big]
+= \Big(\mu + \sum_j K g f\Big)dt\,dA = \lambda(t, x, y)\,dt\,dA .
+$$
+
+The $\bar R$'s and $R(t)$'s cancel, leaving the model's intensity. Candidates that land outside
+$W$ are dropped, so only events inside $W$ ever enter the history, which is exactly what we
+observe in real data.
+
+## The code
+
+```{python}
+def simulate_hawkes_st(mu, K, beta, sigma, T, W, seed=0):
+    if not 0 <= K < 1:                                                          # <1>
+        raise ValueError("need 0 <= K < 1")
+    rng = np.random.default_rng(seed)                                           # <2>
+    xmin, xmax, ymin, ymax = W
+    area = (xmax - xmin) * (ymax - ymin)                                        # <3>
+    events = []
+    t = 0.0
+
+    def candidate_rate(s, past):                                                # <4>
+        return mu * area + np.sum(K * beta * np.exp(-beta * (s - past[:, 0])))
+
+    while True:
+        past = np.array(events).reshape(-1, 3)                                  # <5>
+        R_bar = candidate_rate(t, past)                                         # <6>
+        t += rng.exponential(1 / R_bar)                                         # <7>
+        if t > T:
+            break
+        R_t = candidate_rate(t, past)                                           # <8>
+        if rng.uniform() >= R_t / R_bar:                                        # <9>
+            continue
+        weights = np.concatenate([[mu * area],                                  # <10>
+                                  K * beta * np.exp(-beta * (t - past[:, 0]))])
+        source = rng.choice(len(weights), p=weights / weights.sum())            # <11>
+        if source == 0:
+            x, y = rng.uniform(xmin, xmax), rng.uniform(ymin, ymax)             # <12>
+        else:
+            x, y = past[source - 1, 1:] + rng.normal(0, sigma, 2)               # <13>
+        if xmin <= x <= xmax and ymin <= y <= ymax:                             # <14>
+            events.append((t, x, y))
+    return np.array(events)
+```
+1. Refuse $K \ge 1$: the process would explode.
+2. A seeded random-number generator, for reproducibility.
+3. $|W|$, the area of the window.
+4. $R(s)$ from §2.1: the background's rate plus each past event's child rate.
+5. The history as an $m \times 3$ array. `reshape(-1, 3)` makes the empty history a valid
+   $0 \times 3$ array.
+6. **The bound** $\bar R = R(\text{now})$, valid until the next event because $R$ only decays.
+7. **Candidate time**: an $\text{Exp}(\bar R)$ waiting time. NumPy takes the mean $1/\bar R$.
+8. The true candidate rate at the new time. It is lower because the bumps decayed.
+9. **Time thinning**: reject with probability $1 - R(t)/\bar R$, and loop again from this time.
+10. Each source's rate at time $t$: entry 0 is the background $\mu|W|$, and entry $j$ is event
+    $j$'s child rate.
+11. **Pick the source** with probability proportional to its rate. `p=weights / weights.sum()`
+    turns the rates into probabilities.
+12. Background source: a uniform location in $W$.
+13. Event $j$ (row `source - 1` of `past`): its location plus independent $N(0, \sigma^2)$ shifts
+    in $x$ and $y$.
+14. **Spatial thinning**: keep the event only if it lands inside $W$.
+
+## Running it
+
+```{python}
+true = {"mu": 0.05, "K": 0.5, "beta": 1.0, "sigma": 0.3}
+T, W = 100.0, (0.0, 10.0, 0.0, 10.0)
+area = (W[1] - W[0]) * (W[3] - W[2])
+
+ev = simulate_hawkes_st(**true, T=T, W=W, seed=1)
+n = len(ev)
+print(f"Simulated {n} events; mu|W|T/(1-K) = {true['mu'] * area * T / (1 - true['K']):.0f} "
+      f"(a bit less is expected: some children land outside W)")
+```
+
+# The likelihood
+
+## The general formula
+
+This is the same derivation as in the time-only case, but with tiny space-time cells
+$dt\,dx\,dy$ instead of tiny time intervals. Each cell holds an event with probability
+$\lambda\,dt\,dx\,dy$, or no event with probability $e^{-\lambda\,dt\,dx\,dy}$. Multiply over all
+cells and take logs:
+
+$$
+\boxed{\;\ell(\theta) = \sum_{i=1}^{n}\log\lambda(t_i, x_i, y_i) \;-\; \int_0^T\!\!\int_W \lambda(t, x, y)\,dx\,dy\,dt\;}
+$$
+
+- The first term **rewards** a high intensity *at the times and places where events happened*.
+- The second term (the compensator) is the **expected number of events** in $[0, T] \times W$.
+  It **penalises** a high intensity everywhere.
+
+## The compensator in closed form
+
+The background contributes $\mu|W|T$. For event $j$'s bump, the integral **factorises** into time
+times space, because the bump is separable (§1.2):
+
+$$
+\int_{t_j}^{T}\!\!\int_W K\,g(t - t_j)\,f(x - x_j, y - y_j)\,dx\,dy\,dt
+= K\;\underbrace{\big(1 - e^{-\beta(T - t_j)}\big)}_{\text{time share before } T}\;
+\underbrace{P^x_j\,P^y_j}_{\text{space share inside } W}
+$$
+
+with
+
+$$
+P^x_j = \Phi\Big(\frac{x_{\max} - x_j}{\sigma}\Big) - \Phi\Big(\frac{x_{\min} - x_j}{\sigma}\Big),
+\qquad
+P^y_j = \Phi\Big(\frac{y_{\max} - y_j}{\sigma}\Big) - \Phi\Big(\frac{y_{\min} - y_j}{\sigma}\Big).
+$$
+
+So
+
+$$
+\int_0^T\!\!\int_W\lambda = \mu|W|T + K\sum_{j=1}^n\big(1 - e^{-\beta(T - t_j)}\big)P^x_jP^y_j .
+$$
+
+There are now **two edge effects**. An event near the end of the window ($t_j \approx T$) has
+little time left to trigger children. An event near the border of $W$ sends some of its children
+outside, where we can't see them. Correcting for both is what keeps $K$ unbiased.
+
+## The code
+
+```{python}
+def log_likelihood(params, ev, T, W):
+    mu, K, beta, sigma = params                                                    # <1>
+    t, x, y = ev.T                                                                 # <2>
+    xmin, xmax, ymin, ymax = W
+    area = (xmax - xmin) * (ymax - ymin)
+    log_lam = sum(np.log(intensity(t[i], x[i], y[i], ev[:i], mu, K, beta, sigma))  # <3>
+                  for i in range(len(t)))
+    compensator = mu * area * T + K * np.sum(                                      # <4>
+        (1 - np.exp(-beta * (T - t))) * spatial_share(x, y, sigma, W))
+    return log_lam - compensator                                                   # <5>
+```
+1. Unpack $\theta = (\mu, K, \beta, \sigma)$.
+2. `ev.T` transposes the $n \times 3$ array, so `t, x, y` are its three columns.
+3. **First term.** For each event $i$, `ev[:i]` is every earlier event, because the data are
+   sorted by time. Compute $\lambda(t_i, x_i, y_i)$, take its log, and add. This is $O(n^2)$ work.
+4. **Compensator** from §3.2: the background plus, for every event, $K \times$ time share
+   $\times$ space share.
+5. $\ell(\theta)$.
+
+# Fitting: maximum likelihood
+
+The method is the same as in the time-only case, now with four parameters.
+
+- **Search on the log scale.** Optimise $\phi = \log\theta$, which keeps all of
+  $\mu, K, \beta, \sigma$ positive.
+- **Nelder–Mead.** It needs no derivatives. Minimise $-\ell$.
+- **Standard errors.** $\widehat{\text{Cov}}(\hat\phi) = H^{-1}$, where $H$ is the Hessian of
+  $-\ell$ at $\hat\phi$ (the observed information), computed by finite differences.
+- **Delta method.** $\text{SE}(\hat\theta) \approx \hat\theta\cdot\text{SE}(\hat\phi)$.
+- **95% confidence interval.** $\big[e^{\hat\phi - 1.96\,\text{SE}},\ e^{\hat\phi + 1.96\,\text{SE}}\big]$.
+
+```{python}
+def numerical_hessian(f, z, h=1e-4):
+    k = len(z)
+    H = np.zeros((k, k))
+    for a in range(k):
+        for b in range(k):
+            ea, eb = np.eye(k)[a] * h, np.eye(k)[b] * h                              # <1>
+            H[a, b] = (f(z + ea + eb) - f(z + ea - eb)                               # <2>
+                       - f(z - ea + eb) + f(z - ea - eb)) / (4 * h * h)
+    return H
+
+
+def fit_hawkes_st(ev, T, W):
+    n = len(ev)
+    xmin, xmax, ymin, ymax = W
+    area = (xmax - xmin) * (ymax - ymin)
+    start = np.log([0.5 * n / (area * T), 0.5, 1.0, 1.0])                           # <3>
+
+    def f(log_params):
+        return -log_likelihood(np.exp(log_params), ev, T, W)                        # <4>
+
+    result = minimize(f, start, method="Nelder-Mead",                               # <5>
+                      options={"xatol": 1e-6, "fatol": 1e-6, "maxiter": 5000})
+    log_hat = result.x                                                              # <6>
+    estimate = np.exp(log_hat)
+    cov_log = np.linalg.inv(numerical_hessian(f, log_hat))                          # <7>
+    se_log = np.sqrt(np.diag(cov_log))
+    se = estimate * se_log                                                          # <8>
+    ci_low = np.exp(log_hat - 1.96 * se_log)                                        # <9>
+    ci_high = np.exp(log_hat + 1.96 * se_log)
+    return estimate, se, ci_low, ci_high, -result.fun, result.success               # <10>
+```
+1. Small steps $h e_a$ and $h e_b$ along parameter directions $a$ and $b$.
+2. The four-point formula for $\partial^2 f / \partial\phi_a\partial\phi_b$.
+3. **Starting point.** The observed rate $n/(|W|T)$ estimates roughly $\mu/(1-K)$, so with
+   $K = 0.5$ guess $\mu \approx 0.5\,n/(|W|T)$. Start $\beta = \sigma = 1$, and take logs.
+4. The objective: $-\ell$ at $\theta = e^{\phi}$.
+5. Nelder–Mead with tight tolerances, because we differentiate at the optimum next.
+6. $\hat\phi$, then $\hat\theta = e^{\hat\phi}$.
+7. Covariance of $\hat\phi$: the inverse Hessian.
+8. Delta method back to the original scale.
+9. 95% confidence intervals built on the log scale, which keeps them positive.
+10. `-result.fun` is the maximised log-likelihood. `result.success` reports whether the
+    optimiser converged.
+
+## Results
+
+```{python}
+est, se, lo, hi, ll_hawkes, ok = fit_hawkes_st(ev, T, W)
+table = pd.DataFrame({"true": [true[p] for p in PARAM_NAMES], "estimate": est,
+                      "std. error": se, "95% CI low": lo, "95% CI high": hi}, index=PARAM_NAMES)
+table["CI contains truth"] = (table["95% CI low"] <= table["true"]) & (table["true"] <= table["95% CI high"])
+print(f"max log-likelihood = {ll_hawkes:.2f}; optimiser converged: {ok}")
+table.round(4)
+```
+
+## Double-check: did we really fit the model?
+
+**Check 1: expected count equals observed count.** $\lambda$ is linear in $\mu$ and $K$, so the
+same identity as in the time-only case holds:
+
+$$
+\mu\frac{\partial\ell}{\partial\mu} + K\frac{\partial\ell}{\partial K}
+= \sum_i\frac{\lambda(t_i, x_i, y_i)}{\lambda(t_i, x_i, y_i)} - \int_0^T\!\!\int_W\lambda = n - \Lambda(T) .
+$$
+
+At the maximum both derivatives are zero, so the fitted model must expect exactly $n$ events.
+
+```{python}
+mu_h, K_h, beta_h, sigma_h = est                                                   # <1>
+Lambda_T = mu_h * area * T + K_h * np.sum(                                         # <2>
+    (1 - np.exp(-beta_h * (T - ev[:, 0]))) * spatial_share(ev[:, 1], ev[:, 2], sigma_h, W))
+print(f"Observed events n = {n},  expected under the fit Lambda(T) = {Lambda_T:.3f}")
+```
+1. The fitted parameters.
+2. The compensator over $[0, T] \times W$ at the fit. It is the same formula as in
+   `log_likelihood`.
+
+**Check 2: profile curves.** Vary one parameter, keep the other three at their estimates, and
+plot $\ell$. Each curve should peak at the estimate.
+
+```{python}
+#| fig-cap: "Profile curves: log-likelihood as one parameter varies, with the others fixed at their estimates. Every curve peaks at the estimate (red), so the optimiser found the maximum. The true value (dashed) lies within the confidence interval."
+fig, axes = plt.subplots(1, 4, figsize=(15, 3.4))
+for k, name in enumerate(PARAM_NAMES):                                             # <1>
+    values = np.linspace(lo[k] * 0.9, hi[k] * 1.1, 25)                             # <2>
+    ll_values = []
+    for v in values:
+        params = est.copy()                                                        # <3>
+        params[k] = v                                                              # <4>
+        ll_values.append(log_likelihood(params, ev, T, W))                         # <5>
+    axes[k].plot(values, ll_values)
+    axes[k].axvline(est[k], c="red", lw=1.5, label="estimate")                     # <6>
+    axes[k].axvline(true[name], c="k", ls="--", lw=1, label="true")
+    axes[k].set(xlabel=name, ylabel="log-likelihood" if k == 0 else "")
+axes[0].legend()
+plt.tight_layout()
+```
+1. One panel per parameter.
+2. 25 trial values spanning a bit more than the 95% CI.
+3. Copy the estimates, so `est` itself isn't changed.
+4. Replace only parameter `k`.
+5. Evaluate $\ell$ at that point.
+6. Mark the estimate (red) and the truth (dashed).
+
+# Is the Hawkes model needed? Comparing with Poisson
+
+The homogeneous space-time Poisson model is the special case $K = 0$: $\lambda = \mu$ everywhere.
+Its MLE is $\hat\mu = n/(|W|T)$, which gives
+$\ell_{\text{Poisson}} = n\log\big(n/(|W|T)\big) - n$. The Hawkes model has 3 extra parameters
+($K, \beta, \sigma$), so the likelihood-ratio statistic is compared with $\chi^2_3$. As before,
+this is approximate because $K = 0$ is on the boundary.
+
+```{python}
+ll_poisson = n * np.log(n / (area * T)) - n                                        # <1>
+lr = 2 * (ll_hawkes - ll_poisson)                                                  # <2>
+print(f"LR = {lr:.1f}, p-value ~ {chi2.sf(lr, df=3):.2g}")                         # <3>
+print(f"AIC: Poisson = {2 * 1 - 2 * ll_poisson:.1f}, Hawkes = {2 * 4 - 2 * ll_hawkes:.1f}")  # <4>
+```
+1. The Poisson log-likelihood at its MLE.
+2. The likelihood-ratio statistic.
+3. The p-value from $\chi^2_3$.
+4. AIC $= 2k - 2\ell$ with $k = 1$ and $k = 4$. Lower is better.
+
+# Does the model fit?
+
+## Check A: time-rescaling residuals
+
+Pool over space. The *ground intensity* (events per unit time anywhere in $W$) is
+$\int_W\lambda(t, x, y)\,dx\,dy$, and its integral up to $t_i$ is
+
+$$
+\Lambda(t_i) = \mu|W|t_i + K\sum_{j<i}\big(1 - e^{-\beta(t_i - t_j)}\big)P^x_jP^y_j .
+$$
+
+By the time-rescaling theorem, if the model is right the gaps $\Lambda(t_i) - \Lambda(t_{i-1})$
+are independent $\text{Exp}(1)$.
+
+```{python}
+def rescaled_gaps(ev, mu, K, beta, sigma, W):
+    t, x, y = ev.T
+    xmin, xmax, ymin, ymax = W
+    area = (xmax - xmin) * (ymax - ymin)
+    share = spatial_share(x, y, sigma, W)                                          # <1>
+    Lam = np.array([mu * area * t[i]                                               # <2>
+                    + K * np.sum((1 - np.exp(-beta * (t[i] - t[:i]))) * share[:i])
+                    for i in range(len(t))])
+    return np.diff(Lam, prepend=0.0)                                               # <3>
+
+
+gaps = rescaled_gaps(ev, *est, W)
+gaps_poisson = np.diff(ev[:, 0] * n / T, prepend=0.0)                              # <4>
+print(f"KS vs Exp(1): Hawkes p = {kstest(gaps, 'expon').pvalue:.3f}, "
+      f"Poisson p = {kstest(gaps_poisson, 'expon').pvalue:.2g}")
+```
+1. Each event's spatial share inside $W$, computed once.
+2. $\Lambda(t_i)$ from the formula above.
+3. Consecutive gaps, starting from $\Lambda(0) = 0$.
+4. Under Poisson, $\Lambda(t) = (n/T)\,t$.
+
+**This check is weak here, and the reason matters.** The Hawkes model passes, but the Poisson
+model is *not* clearly rejected either. The bursts are **local in space**: a cascade at
+$(2, 8)$ and quiet everywhere else. Pooling the whole map into one time series dilutes them, so
+the pooled event times look nearly Poisson. A purely temporal test can't see localised clustering.
+This is the same reason the research project needs *space-time* methods to find *localised*
+regime shifts.
+
+## Check B: space-time close pairs
+
+Count the pairs of events that are close in **both** time and space ($|\Delta t| < 1$ and
+distance $< 1$). Then simulate 19 new datasets from each fitted model and count the same thing.
+If a model is right, the observed count should look like a typical value from its simulations.
+This is a *parametric bootstrap*. With 19 simulations, an observed value outside the whole
+simulated range is significant at the 5% level.
+
+```{python}
+def close_pairs(ev, dt_max=1.0, d_max=1.0):
+    t, x, y = ev.T
+    i, j = np.triu_indices(len(t), k=1)                                            # <1>
+    near_t = np.abs(t[i] - t[j]) < dt_max                                          # <2>
+    near_s = (x[i] - x[j]) ** 2 + (y[i] - y[j]) ** 2 < d_max**2                    # <3>
+    return int(np.sum(near_t & near_s))                                            # <4>
+
+
+def simulate_poisson_st(rate, T, W, rng):
+    xmin, xmax, ymin, ymax = W
+    m = rng.poisson(rate * (xmax - xmin) * (ymax - ymin) * T)                      # <5>
+    sim = np.column_stack([rng.uniform(0, T, m), rng.uniform(xmin, xmax, m),       # <6>
+                           rng.uniform(ymin, ymax, m)])
+    return sim[np.argsort(sim[:, 0])]
+
+
+rng = np.random.default_rng(123)
+observed = close_pairs(ev)
+sims_hawkes = [close_pairs(simulate_hawkes_st(*est, T=T, W=W, seed=s))             # <7>
+               for s in range(1000, 1019)]
+sims_poisson = [close_pairs(simulate_poisson_st(n / (area * T), T, W, rng))        # <8>
+                for _ in range(19)]
+print(f"Observed close pairs: {observed}")
+print(f"Fitted Hawkes simulations:  {min(sims_hawkes)} to {max(sims_hawkes)}")
+print(f"Fitted Poisson simulations: {min(sims_poisson)} to {max(sims_poisson)}")
+```
+1. Every pair $(i, j)$ with $i < j$.
+2. Close in time.
+3. Close in space.
+4. Count the pairs that are close in both.
+5. Poisson count with mean $\hat\mu|W|T$.
+6. Uniform times and locations, sorted by time.
+7. 19 datasets simulated from the **fitted Hawkes** parameters.
+8. 19 datasets simulated from the **fitted Poisson** rate.
+
+The observed count sits inside the Hawkes range and far above the Poisson range. Space-time
+clustering is real, and the fitted Hawkes model reproduces it.
+
+## Plots
+
+```{python}
+#| fig-cap: "Left: all events, coloured by time. Clusters are hard to see by eye when all times are mixed together. Middle: the fitted intensity map just after the busiest moment. Bright spots are where recent events are raising the rate. Away from them it falls back to the background mu. Right: QQ plot of the time-rescaled gaps. Both models look similar here, which is why Check B is needed."
+fig, axes = plt.subplots(1, 3, figsize=(16, 4.6))
+
+sc = axes[0].scatter(ev[:, 1], ev[:, 2], c=ev[:, 0], s=5, cmap="viridis")         # <1>
+axes[0].set(xlabel="x", ylabel="y", aspect="equal", title="Events (colour = time)")
+fig.colorbar(sc, ax=axes[0], label="time")
+
+recent = [np.sum((ev[:, 0] > ti - 2) & (ev[:, 0] <= ti)) for ti in ev[:, 0]]      # <2>
+t_star = ev[int(np.argmax(recent)), 0] + 0.05
+gx, gy = np.meshgrid(np.linspace(0, 10, 150), np.linspace(0, 10, 150))            # <3>
+past = ev[ev[:, 0] < t_star]
+lam_map = np.vectorize(lambda a, b: intensity(t_star, a, b, past, *est))(gx, gy)  # <4>
+im = axes[1].imshow(lam_map, origin="lower", extent=[0, 10, 0, 10], cmap="magma") # <5>
+axes[1].set(xlabel="x", ylabel="y", title=f"Fitted λ(t, x, y) at t = {t_star:.1f}")
+fig.colorbar(im, ax=axes[1], label="intensity")
+
+q = -np.log(1 - (np.arange(1, n + 1) - 0.5) / n)                                  # <6>
+axes[2].plot(q, np.sort(gaps), ".", ms=3, label="Hawkes fit")
+axes[2].plot(q, np.sort(gaps_poisson), ".", ms=3, label="Poisson fit")
+axes[2].plot([0, q.max()], [0, q.max()], c="grey", lw=1)
+axes[2].set(xlabel="Exp(1) quantiles", ylabel="rescaled gaps", title="Time-rescaling QQ plot")
+axes[2].legend()
+plt.tight_layout()
+```
+1. A scatter plot of locations, coloured by time.
+2. For each event, count the events in the previous 2 time units. Take the busiest moment, plus
+   a small offset so its own bump shows.
+3. A $150 \times 150$ grid over $W$.
+4. The fitted $\lambda(t^*, x, y)$ at every grid point, using only events before $t^*$.
+5. Draw it as a heat map.
+6. $\text{Exp}(1)$ quantiles for the QQ plot.
+
+# Summary
+
+| Step | Mathematics | Result here |
+|---|---|---|
+| Model | $\lambda = \mu + \sum K\,\beta e^{-\beta\Delta t}\,\frac{1}{2\pi\sigma^2}e^{-d^2/2\sigma^2}$ | separable "when × where" bumps |
+| Simulation | thin in time ($R(t)/\bar R$), pick a source, thin in space (inside $W$) | `{python} n` events |
+| Likelihood | $\sum\log\lambda_i - \int\!\!\int\lambda$, with time and space edge corrections | closed form with $\Phi$ |
+| Fit | MLE on the log scale with Nelder–Mead | all four 95% CIs contain the truth |
+| Fit is real | $\Lambda(T) = n$ and profile peaks | $\Lambda(T)$ = `{python} f"{Lambda_T:.3f}"` |
+| vs Poisson | $\text{LR} = 2(\ell_H - \ell_P)$, $\chi^2_3$ | LR = `{python} f"{lr:.0f}"` |
+| Time residuals | gaps of $\Lambda(t_i)$ $\sim$ Exp(1) | weak: pooling over space hides local bursts |
+| Space-time check | close pairs vs simulations | observed `{python} observed`; Hawkes `{python} f"{min(sims_hawkes)}–{max(sims_hawkes)}"`, Poisson `{python} f"{min(sims_poisson)}–{max(sims_poisson)}"` |

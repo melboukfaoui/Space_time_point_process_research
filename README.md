@@ -38,7 +38,7 @@ You need [uv](https://docs.astral.sh/uv/), [R](https://cran.r-project.org/) (≥
 [Quarto](https://quarto.org/). On macOS:
 
 ```bash
-brew install uv quarto
+brew install uv quarto   # or skip quarto: `uv sync` installs it as a dev dependency
 brew install --cask r
 ```
 
@@ -74,11 +74,26 @@ pass between languages: `py$x` from R, `r.x` from Python.
 
 ```bash
 uv sync                                           # Python env must exist first
-quarto render notebooks/00-setup-check.qmd        # one notebook
-quarto preview notebooks/00-setup-check.qmd       # live preview while editing
+uv run quarto render notebooks/00-setup-check.qmd     # one notebook
+uv run quarto preview notebooks/00-setup-check.qmd    # live preview while editing
 ```
 
 `notebooks/00-setup-check.qmd` is a quick test that both languages work.
+
+## Hawkes process code
+
+| File | What it is |
+|---|---|
+| `scripts/hawkes_basic.py` | Temporal Hawkes: thinning simulation, MLE fit, SEs/CIs, Poisson LR test, residuals (every line commented) |
+| `scripts/hawkes_spacetime.py` | Space-time Hawkes: the same steps in space and time, plus a space-time close-pairs check |
+| `notebooks/03-hawkes-explained.qmd` | Explained version of `hawkes_basic.py`: maths and line-by-line notes |
+| `notebooks/04-hawkes-spacetime-explained.qmd` | Explained version of `hawkes_spacetime.py` |
+| `notebooks/01-hawkes-simulate-and-fit.qmd` | Space-time Hawkes via Robert's branching simulator (`src/stpp/hawkes.py`) |
+| `notebooks/02-hawkes-thinning-and-fit.qmd` | Temporal Hawkes with O(n) likelihood and exact gradient (`src/stpp/hawkes_temporal.py`) |
+| `R/simulate_hawkes_clustering.R` | Robert's R branching simulator |
+
+Run a script with `uv run python scripts/hawkes_spacetime.py`; render a page with
+`uv run quarto render notebooks/04-hawkes-spacetime-explained.qmd` (output in `_output/`).
 
 ## Data
 
